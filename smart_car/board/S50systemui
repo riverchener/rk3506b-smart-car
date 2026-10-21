@@ -1,0 +1,31 @@
+#!/bin/sh
+# 出厂 Qt 主界面（/userdata/ui/systemui + controlcenter）已被 Smart_car 接管。
+#
+# 原脚本 /etc/init.d/S50systemui 会拉起 systemui 和 controlcenter，
+# 它们是 720x1280 竖屏构图的出厂桌面，在我们的 1280x720 横屏车机应用之前
+# 先画一屏（观感"翻转压缩"），其下拉控制中心还会抢触摸导致卡死。
+#
+# 备份：/userdata/smart_car/S50systemui.orig（**不要**放在 /etc/init.d/ 下）
+# 恢复：cp /userdata/smart_car/S50systemui.orig /etc/init.d/S50systemui
+#
+# ⚠️ 血泪教训：rcS 用的是 `for i in /etc/init.d/S??*`，所以任何叫
+#    `S<两个字符>xxx` 的备份文件都会被当成启动脚本执行！
+#    把厂商原脚本备份成 `/etc/init.d/S50systemui.orig` 的结果就是：本脚本禁用
+#    原厂界面后，紧接着 .orig 又被执行一次，原厂 systemui/controlcenter 照常启动
+#    （屏幕上是翻转压缩的竖屏界面）。备份要么藏成 `.S50systemui.orig`
+#    （以点开头，glob 不匹配），要么放到 /userdata 下。
+#
+# 如需临时手动启动出厂界面：/userdata/smart_car/S50systemui.orig start
+
+case "$1" in
+    start)
+        echo "S50systemui disabled (Smart_car owns the display)"
+        ;;
+    stop)
+        killall systemui controlcenter dynamicIsland 2>/dev/null
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        ;;
+esac
+exit 0

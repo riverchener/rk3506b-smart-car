@@ -1,0 +1,181 @@
+#!/bin/sh
+#
+# bt-agent —— 常驻的 bluetoothctl 会话（带 pairing agent）
+#
+# 【它到底解决什么问题】
+# 手机配对完之后会**立刻连过来放歌**（A2DP 入连接）。BlueZ 处理入连接时，
+# 会先问 agent 一句"是否授权这个服务"。如果此刻没有任何 agent 注册，
+# bluetoothd 直接拒绝，日志是：
+#     "Authentication attempt without agent"
+#     profiles/audio/a2dp.c:auth_cb() Access denied: org.bluez.Error.Rejected
+# 现场表现就是：**手机显示"已配对"，车机显示"未配对"，放歌怎么都连不上**。
+# 手机重试几次之后放弃，BlueZ 还会把这个 bond 一起丢掉。
+#
+# 【为什么不能每次起一个 bluetoothctl】
+# `bluetoothctl --agent X pair Y` 的生命周期是
+#   起进程 -> 注册 agent -> 执行 pair -> 退出 -> 注销 agent
+# 命令一结束 agent 就消失了，而手机的 A2DP 入连接正好在这之后到来，
+# 于是必然被 "Access denied" 拒掉。所以 agent 必须**一直注册着**。
+#
+# 【为什么以前这个脚本也没真正常驻（重要）】
+# 以前用 FIFO 给常驻 bluetoothctl 送命令，`printf > fifo` 写完就 close。
+# 对 FIFO 而言，最后一个写端关闭 = 读端读到 EOF，而 bluetoothctl 把 EOF
+# 当作"退出"。于是每 send 一次，会话就死一次 —— "常驻"是假的。
+# 现在先起一个 sleep 进程**一直持有写端**，读端永远看不到 EOF。
+#
+# 用法（一般由 bt-ctl / S46 调用）：
+#   bt-agent start    启动常驻会话
+#   bt-agent stop     停止
+#   bt-agent status   看状态
+#   bt-agent send "pair XX:XX:..."   往会话里送一条命令
+#   bt-agent watch      前台守护：会话死了自动拉起（开机时后台跑）
+#   bt-agent watch-all  同 watch，但**同时**看住 bluealsa（A2DP Sink 端点）。
+#                       开机脚本用的是这个 —— 两个都在一个循环里，
+#                       不会出现"看门狗自己悄悄没了却以为还在守"。
+set -u
+
+FIFO=/var/run/bt-agent.fifo
+LOG=/userdata/bt-agent.log
+PIDF=/var/run/bt-agent.pid
+HOLDF=/var/run/bt-agent.hold
+
+# agent 能力：必须是 NoInputNoOutput。
+#
+# 这块板子**没有屏幕也没有键盘**。声明成 KeyboardDisplay 等于告诉手机
+# "我能显示 6 位通行密钥、也有键盘能输入"，手机（本身也是 KeyboardDisplay）
+# 于是协商出 Passkey Entry —— 需要有人念出板子上的数字再敲进手机，
+# 板子做不到，手机上就报"PIN 码或通行密钥不正确"。
+#
+# NoInputNoOutput 让协商结果落到 Just Works：免交互，直接配对成功。
+CAP="${SMARTCAR_BT_AGENT_CAP:-NoInputNoOutput}"
+
+alive() {
+    [ -p "$FIFO" ] || return 1
+    [ -e "$PIDF" ] || return 1
+    kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# start() 必须**互斥**。
+#
+# 2026-10-13 冷启动实测到的现象：bt-boot-setup 里"看门狗 watch-all"和
+# "常驻 agent"两处几乎同时调 start()，两边都过了 alive 检查（都还没起来），
+# 都去 stop()+mkfifo —— 其中一路就报
+#     FAIL: 无法创建 /var/run/bt-agent.fifo
+# 虽然 5 秒后 watch-all 会把它救回来（最终 Agent registered 是好的），
+# 但开机日志里留一条 FAIL 会让人误判"agent 没起来"，且极端时序下可能两边
+# 各起一个 bluetoothctl，互相抢 agent 注册（本项目出现过"多个实例互相踩"）。
+#
+# 用一个原子 mkdir 当锁（busybox 没有 flock），等不到就放弃并如实报错 ——
+# 反正另一个调用者已经在起了，watch-all 下一轮也会兜住。
+# ---------------------------------------------------------------------------
+LOCK=/var/run/bt-agent.lock
+
+start() {
+    i=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        i=$((i + 1))
+        # 已经有人在起了：他起完我们就直接成功返回
+        if alive; then
+            echo "已在运行 (pid $(cat "$PIDF"), cap $CAP)"
+            return 0
+        fi
+        if [ $i -ge 20 ]; then
+            echo "SKIP: 另一个 bt-agent start 正在进行（锁 $LOCK 被占）"
+            return 0
+        fi
+        sleep 0.3
+    done
+
+    if alive; then
+        rmdir "$LOCK" 2>/dev/null
+        echo "已在运行 (pid $(cat "$PIDF"), cap $CAP)"
+        return 0
+    fi
+
+    stop >/dev/null 2>&1
+
+    mkfifo "$FIFO" 2>/dev/null || { echo "FAIL: 无法创建 $FIFO"; rmdir "$LOCK" 2>/dev/null; return 1; }
+    chmod 600 "$FIFO"
+
+    # ① 持有写端的进程：保证 bluetoothctl 的 stdin 永远不 EOF
+    setsid sh -c "exec sleep 2147483647 > '$FIFO'" </dev/null >/dev/null 2>&1 &
+    echo $! > "$HOLDF"
+
+    # ② 常驻 bluetoothctl，stdin 接 FIFO，agent 一直注册着
+    setsid sh -c "exec bluetoothctl --agent $CAP < '$FIFO' > '$LOG' 2>&1" \
+        </dev/null >/dev/null 2>&1 &
+
+    sleep 2
+    p=$(pgrep -f "bluetoothctl --agent $CAP" | head -1)
+    rmdir "$LOCK" 2>/dev/null
+    if [ -n "$p" ]; then
+        echo "$p" > "$PIDF"
+        echo "已启动 (pid $p, cap $CAP)"
+        return 0
+    fi
+    echo "FAIL: bluetoothctl 没起来"
+    return 1
+}
+
+stop() {
+    [ -e "$PIDF" ] && kill -9 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null
+    [ -e "$HOLDF" ] && kill -9 "$(cat "$HOLDF" 2>/dev/null)" 2>/dev/null
+    rm -f "$PIDF" "$HOLDF" "$FIFO"
+    rmdir "$LOCK" 2>/dev/null
+    echo "已停止"
+    return 0
+}
+
+status() {
+    if alive; then
+        echo "运行中 pid=$(cat "$PIDF") cap=$CAP fifo=$FIFO"
+    else
+        echo "未运行"
+        return 1
+    fi
+}
+
+send() {
+    alive || start >/dev/null 2>&1
+    # 后台写，避免万一没有读端时把调用方卡死；
+    # 读端不会 EOF，因为 holder 一直持有写端
+    printf '%s\n' "$1" > "$FIFO" &
+    echo "已发送: $1"
+    return 0
+}
+
+watch() {
+    while true; do
+        alive || start >/dev/null 2>&1
+        sleep 5
+    done
+}
+
+# 【2026-10-13 加】原来 3b 里那个 bluealsa 看门狗写成了一次性 setsid，
+# 如果那个 shell 自己被回收，看门狗就静默消失（"以为在守、其实没守"，
+# 这类假守护在本项目踩过不止一次）。所以把**两个**关键进程都放进
+# 同一个永不退出的 watch 循环里：
+#   · bt-agent 常驻 bluetoothctl 会话（没有 agent，BlueZ 会直接拒掉手机的
+#     A2DP 授权请求 —— 这正是刷机后"能连但会掉"的头号原因）
+#   · bluealsa（A2DP Sink 端点本身；它没了手机就看不到"音箱"）
+watch_all() {
+    BTCTL=/userdata/smart_car/bt-ctl
+    while true; do
+        alive || start >/dev/null 2>&1
+        if ! pidof bluealsa >/dev/null 2>&1; then
+            [ -x "$BTCTL" ] && "$BTCTL" audio-on >>/var/log/smartcar-bt.log 2>&1
+        fi
+        sleep 5
+    done
+}
+
+case "${1:-}" in
+    start)  start ;;
+    stop)   stop ;;
+    status) status ;;
+    send)   shift; send "$*" ;;
+    watch)  watch ;;
+    watch-all) watch_all ;;
+    *) echo "Usage: $0 {start|stop|status|send \"<cmd>\"|watch|watch-all}"; exit 1 ;;
+esac

@@ -1,0 +1,420 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/*
+ * sc_rpmsg.c - the M0 side of the A7 <-> M0 rpmsg service (RT-Thread port).
+ *
+ * Transport: rpmsg-lite over the RK3506 mailbox, vrings in DDR at
+ * 0x03c00000 (the `rpmsg@3c00000` reserved region in the device tree).
+ * Endpoint 0x4004, service name "rpmsg-smartcar", link id 0x03 (master 0,
+ * remote 3 = bus M0) - byte-identical to the bare-metal firmware, so
+ * sc_sensors.ko and sc_client need no changes at all.
+ *
+ * Threading model (this is where RT-Thread earns its place):
+ *
+ *   mailbox ISR      rpmsg_env_isr -> virtqueue_notification -> sc_rx_cb()
+ *                    must not block: it copies the 24 byte frame into a small
+ *                    ring and posts the slot index to a mailbox.
+ *   "rpmsg" thread   blocks on rt_mb_recv(), runs the command, sends the
+ *                    reply.  Because a real RTOS mutex now protects rpmsg-lite
+ *                    (see rpmsg_env_rtthread.c) this reply path can safely
+ *                    coexist with the sensor pushes from the "sr04" thread.
+ *   "sr04" thread    pushes SC_EVT_SAMPLE frames to whoever subscribed.
+ *
+ * The wire format, the command set, the status codes and the field meanings
+ * are unchanged; 0x0004 BUZZER and 0x0007 LOOP were already unimplemented in
+ * the bare-metal firmware and still answer SC_ST_BADARG.
+ */
+
+#include "sc_app.h"
+
+#include "rpmsg_lite.h"
+#include "rpmsg_ns.h"
+
+#include <string.h>
+
+static struct rpmsg_lite_instance *sc_inst;
+static struct rpmsg_lite_endpoint *sc_ept;
+static volatile uint32_t sc_master_ept;
+
+/* --- DHT11: the A7 owns the sensor and pushes its readings here ---------- */
+#define SC_DHT_GRACE_US  10000000U      /* pushed values stay valid for 10 s */
+static rt_uint32_t sc_dht_period_ms;    /* 0 = the M0 does not sample it    */
+static rt_uint32_t sc_dht_temp_x10;
+static rt_uint32_t sc_dht_hum_x10;
+static rt_uint32_t sc_dht_fresh;
+static rt_uint32_t sc_dht_from_a7;
+static rt_uint32_t sc_dht_a7_us;
+
+static rt_uint32_t sc_sample_seq;
+static volatile rt_uint32_t sc_push_count;
+
+/* --- RX ring: filled by the ISR, drained by the rpmsg thread -------------- */
+#define SC_RXQ_LEN 4
+static struct sc_frame sc_rxq[SC_RXQ_LEN];
+static volatile rt_uint8_t sc_rxq_w;
+static struct rt_mailbox sc_rx_mb;
+static rt_ubase_t sc_rx_mb_pool[SC_RXQ_LEN];
+
+/* reply scratch: only ever touched by the rpmsg thread */
+static struct sc_frame sc_rsp;
+
+/* ------------------------------------------------------------------------ */
+/* helpers                                                                   */
+/* ------------------------------------------------------------------------ */
+static void sc_send(struct sc_frame *f)
+{
+    if (sc_ept == RT_NULL)
+    {
+        return;
+    }
+    /* bounded wait (ms) instead of RL_BLOCK: if the A7 ever stops draining its
+     * receive queue this thread must still come back to serve new requests */
+    if (rpmsg_lite_send(sc_inst, sc_ept, sc_master_ept, (char *)f,
+                        sizeof(struct sc_frame), 100UL) != RL_SUCCESS)
+    {
+        rt_kprintf("[sc] rpmsg send failed\n");
+    }
+}
+
+static void sc_ns_cb(uint32_t new_ept, const char *new_ept_name, uint32_t flags, void *user_data)
+{
+    RT_UNUSED(flags);
+    RT_UNUSED(user_data);
+
+    rt_kprintf("[sc] ns '%s' ept %u\n",
+               new_ept_name ? new_ept_name : "?", (unsigned)new_ept);
+}
+
+/* Runs in the mailbox ISR: copy and hand off, never block. */
+static int32_t sc_rx_cb(void *payload, uint32_t payload_len, uint32_t src, void *priv)
+{
+    rt_uint8_t w;
+
+    RT_UNUSED(priv);
+
+    if (payload_len >= sizeof(struct sc_frame))
+    {
+        w = sc_rxq_w;
+        memcpy(&sc_rxq[w], payload, sizeof(struct sc_frame));
+        sc_master_ept = src;
+        sc_rxq_w = (rt_uint8_t)((w + 1U) % SC_RXQ_LEN);
+        (void)rt_mb_send(&sc_rx_mb, (rt_ubase_t)w);
+    }
+
+    return RL_RELEASE;
+}
+
+/* ------------------------------------------------------------------------ */
+/* DHT11 cache (A7 pushes; used for the console line and SC_CMD_LATEST)      */
+/* ------------------------------------------------------------------------ */
+void sc_dht_push(rt_uint32_t temp_x10, rt_uint32_t hum_x10)
+{
+    if (temp_x10 != 0U || hum_x10 != 0U)
+    {
+        sc_dht_temp_x10 = temp_x10;
+        sc_dht_hum_x10 = hum_x10;
+        sc_dht_from_a7 = 1U;
+        sc_dht_a7_us = sc_now_us();
+        sc_dht_fresh = 1U;
+    }
+}
+
+rt_uint32_t sc_dht_cache(rt_uint32_t *temp_x10, rt_uint32_t *hum_x10)
+{
+    rt_uint32_t valid;
+
+    if (sc_dht_from_a7 != 0U)
+    {
+        valid = ((sc_now_us() - sc_dht_a7_us) < SC_DHT_GRACE_US) ? 1U : 0U;
+    }
+    else
+    {
+        valid = sc_dht_fresh;
+    }
+
+    if (temp_x10 != RT_NULL)
+    {
+        *temp_x10 = sc_dht_temp_x10;
+    }
+    if (hum_x10 != RT_NULL)
+    {
+        *hum_x10 = sc_dht_hum_x10;
+    }
+
+    return valid;
+}
+
+void sc_dht_subscribe(rt_uint32_t period_ms)
+{
+    sc_dht_period_ms = period_ms;
+    if (period_ms == 0U)
+    {
+        sc_dht_fresh = 0U;      /* disabled: stop reporting the cached value */
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* unsolicited push to the subscriber                                        */
+/* ------------------------------------------------------------------------ */
+void sc_push_sample(void)
+{
+    struct sc_frame ev;
+    rt_uint32_t echo_us = 0U, mm = 0U, ok = 0U;
+
+    if (sc_master_ept == 0U)
+    {
+        return;                 /* nobody subscribed yet */
+    }
+    if (sc_sr04_period_ms() == 0U && sc_dht_period_ms == 0U)
+    {
+        return;                 /* nothing enabled */
+    }
+
+    (void)sc_sr04_cache(&echo_us, &mm, &ok);
+
+    memset(&ev, 0, sizeof(ev));
+    ev.cmd = SC_EVT_SAMPLE;
+    ev.seq = (rt_uint16_t)(sc_sample_seq++ & 0xFFFFU);
+    ev.status = (ok ? SC_EVT_SR04_VALID : 0U) |
+                (sc_dht_fresh ? SC_EVT_DHT_VALID : 0U);
+    ev.a = echo_us;
+    ev.b = mm;
+    ev.c = ((sc_dht_temp_x10 & 0xFFFFU) << 16) | (sc_dht_hum_x10 & 0xFFFFU);
+    ev.t = sc_now_us();
+
+    sc_send(&ev);
+    sc_push_count++;
+}
+
+/* ------------------------------------------------------------------------ */
+/* command handling (same semantics as the bare-metal sc_handle)             */
+/* ------------------------------------------------------------------------ */
+static void sc_timer_jitter(rt_uint32_t iterations, rt_uint32_t period_us,
+                            rt_uint32_t *min_us, rt_uint32_t *max_us, rt_uint32_t *avg_us)
+{
+    rt_uint32_t i, t0, t1, d, lo = 0xFFFFFFFFU, hi = 0U;
+    rt_uint32_t sum = 0U;
+
+    if (iterations == 0U || iterations > 20000U)
+    {
+        iterations = 1000U;
+    }
+    if (period_us == 0U || period_us > 100000U)
+    {
+        period_us = 100U;
+    }
+
+    for (i = 0U; i < iterations; i++)
+    {
+        t0 = sc_now_us();
+        HAL_DelayUs(period_us);
+        t1 = sc_now_us();
+        d = t1 - t0;
+        if (d < lo)
+        {
+            lo = d;
+        }
+        if (d > hi)
+        {
+            hi = d;
+        }
+        sum += d;
+    }
+
+    *min_us = lo;
+    *max_us = hi;
+    *avg_us = sum;              /* the caller (Linux) divides: saves a libcall */
+}
+
+static void sc_handle(struct sc_frame *req, struct sc_frame *rsp)
+{
+    memset(rsp, 0, sizeof(*rsp));
+    rsp->cmd = (rt_uint16_t)(req->cmd | SC_RSP);
+    rsp->seq = req->seq;
+    rsp->status = SC_ST_OK;
+
+    switch (req->cmd)
+    {
+    case SC_CMD_PING:
+        break;
+
+    case SC_CMD_TIME:
+    {
+        uint64_t t = HAL_GetSysTimerCount();
+
+        rsp->a = (rt_uint32_t)t;
+        rsp->b = (rt_uint32_t)(t >> 32);
+        break;
+    }
+
+    case SC_CMD_JITTER:
+        sc_timer_jitter(req->a, req->b, &rsp->a, &rsp->b, &rsp->c);
+        break;
+
+    case SC_CMD_SR04:
+    {
+        rt_uint32_t to = req->a ? req->a : 30000U;
+        rt_uint32_t us = sc_sr04_read(to, &rsp->status);
+
+        rsp->a = us;
+        rsp->b = (us * 10U) / 58U;      /* echo us -> distance in mm */
+        break;
+    }
+
+    case SC_CMD_DHT11:
+        /* The A7 owns the DHT11 (its bit timing is far more reliable than the
+         * M0's); the bare-metal firmware documented NODEV here as well. */
+        rsp->status = SC_ST_NODEV;
+        break;
+
+    case SC_CMD_INFO:
+        rsp->a = SC_FW_VERSION;
+        rsp->b = (rt_uint32_t)((char *)__heap_end - (char *)__heap_start);
+        rsp->c = SC_CNT_PER_US;
+        break;
+
+    case SC_CMD_SUBSCRIBE:
+        /* a = SR04 period ms, b = DHT11 period ms (0 disables that sensor) */
+        if (req->a > 60000U || req->b > 60000U)
+        {
+            rsp->status = SC_ST_BADARG;
+            break;
+        }
+        sc_sr04_subscribe(req->a);
+        sc_dht_subscribe(req->b);
+        rt_kprintf("[sc] subscribe sr04=%ums dht11=%ums\n",
+                   (unsigned)req->a, (unsigned)req->b);
+        /* sample once right away so the subscriber sees data immediately */
+        if (req->a != 0U)
+        {
+            sc_sample_sr04();
+        }
+        else
+        {
+            sc_sr04_clear();
+        }
+        /* fall through to reporting the cache, exactly like the bare-metal
+         * firmware did */
+        /* fall through */
+
+    case SC_CMD_LATEST:
+        if (req->cmd == SC_CMD_LATEST && sc_sr04_period_ms() == 0U)
+        {
+            /* no subscription: take one shot now (SR04 is cheap, < 20 ms) */
+            sc_sample_sr04();
+        }
+        {
+            rt_uint32_t echo_us = 0U, mm = 0U, ok = 0U;
+            rt_uint32_t temp_x10 = 0U, hum_x10 = 0U;
+            rt_uint32_t dht_valid;
+
+            (void)sc_sr04_cache(&echo_us, &mm, &ok);
+            dht_valid = sc_dht_cache(&temp_x10, &hum_x10);
+            rsp->status = (ok ? SC_EVT_SR04_VALID : 0U) |
+                          (dht_valid ? SC_EVT_DHT_VALID : 0U);
+            rsp->a = mm;
+            rsp->b = temp_x10;
+            rsp->c = hum_x10;
+        }
+        break;
+
+    case SC_CMD_PUSH_DHT:
+        /* the A7 tells us what it read, so the console can print distance +
+         * temperature + humidity on one line */
+        sc_dht_push(req->a, req->b);
+        (void)sc_dht_cache(&rsp->a, &rsp->b);
+        break;
+
+    case SC_CMD_TONE:
+        /* a = frequency in Hz, 0 stops the tone */
+        if (req->a > 20000U)
+        {
+            rsp->status = SC_ST_BADARG;
+            break;
+        }
+        sc_carctl_tone(req->a);
+        rsp->a = sc_carctl_tone_freq();
+        break;
+
+    case SC_CMD_CARCTL:
+        /* a = mask: bit0 left, bit1 right, bit2 hazard, bit3 reverse,
+         *           bit4 low beam, bit5 high beam
+         * reply a = the mask that is now in effect (the A7 reads it back
+         * through /dev/mycarctl) */
+        sc_carctl_mask_set((rt_uint8_t)(req->a & 0x3FU));
+        rsp->a = sc_carctl_mask_get();
+        break;
+
+    default:
+        rsp->status = SC_ST_BADARG;
+        break;
+    }
+
+    rsp->t = sc_now_us();
+}
+
+/* ------------------------------------------------------------------------ */
+/* the rpmsg thread                                                          */
+/* ------------------------------------------------------------------------ */
+#define SC_RPMSG_THREAD_STACK 512
+#define SC_RPMSG_THREAD_PRIO  4
+
+static struct rt_thread sc_rpmsg_tcb;
+static rt_uint8_t sc_rpmsg_stack[SC_RPMSG_THREAD_STACK];
+
+static void sc_rpmsg_entry(void *parameter)
+{
+    rt_ubase_t idx;
+
+    RT_UNUSED(parameter);
+
+    rt_mb_init(&sc_rx_mb, "scrx", sc_rx_mb_pool, SC_RXQ_LEN, RT_IPC_FLAG_FIFO);
+
+    sc_inst = rpmsg_lite_remote_init((void *)&__linux_share_rpmsg_start__[0],
+                                     RL_PLATFORM_SET_LINK_ID(SC_MASTER_ID, SC_REMOTE_ID),
+                                     RL_NO_FLAGS);
+    if (sc_inst == RT_NULL)
+    {
+        SC_PROBE_FAIL(1);
+        rt_kprintf("[sc] rpmsg_lite_remote_init failed\n");
+        return;
+    }
+    SC_PROBE(3);
+
+    /* sleeps on a semaphore until the A7 kicks the mailbox */
+    rpmsg_lite_wait_for_link_up(sc_inst);
+    SC_PROBE(4);
+
+    rpmsg_ns_bind(sc_inst, sc_ns_cb, RT_NULL);
+    sc_ept = rpmsg_lite_create_ept(sc_inst, SC_EPT_ID, sc_rx_cb, RT_NULL);
+    if (sc_ept == RT_NULL)
+    {
+        SC_PROBE_FAIL(2);
+        rt_kprintf("[sc] rpmsg create_ept failed\n");
+        return;
+    }
+    SC_PROBE(5);
+
+    rpmsg_ns_announce(sc_inst, sc_ept, SC_EPT_NAME, RL_NS_CREATE);
+    SC_PROBE(6);
+
+    rt_kprintf("[sc] svc '%s' up (rt-thread), sr04=%ums dht11=%ums\n",
+               SC_EPT_NAME, (unsigned)sc_sr04_period_ms(), (unsigned)sc_dht_period_ms);
+
+    for (;;)
+    {
+        if (rt_mb_recv(&sc_rx_mb, &idx, RT_WAITING_FOREVER) == RT_EOK)
+        {
+            sc_handle(&sc_rxq[idx], &sc_rsp);
+            sc_send(&sc_rsp);
+            SC_PROBE_BASE->extra++;
+        }
+    }
+}
+
+void sc_rpmsg_start(void)
+{
+    rt_thread_init(&sc_rpmsg_tcb, "rpmsg", sc_rpmsg_entry, RT_NULL,
+                   sc_rpmsg_stack, sizeof(sc_rpmsg_stack),
+                   SC_RPMSG_THREAD_PRIO, 10);
+    rt_thread_startup(&sc_rpmsg_tcb);
+}

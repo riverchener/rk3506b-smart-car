@@ -1,0 +1,160 @@
+#!/bin/sh
+#
+# bt-boot-setup —— 开机把蓝牙配置成"随时可连的音箱"
+#
+# 由 /etc/init.d/S46bluetooth-audio 在后台调用。单独一个文件是为了
+# 避免在 init 脚本里写嵌套引号（那种写法极易出错且难维护）。
+#
+# 步骤：
+#   1) 等 hci0 出现（USB 蓝牙枚举慢）
+#   2) power on + 设置名称 + pairable on + discoverable on
+#      —— 手机蓝牙列表里才看得到 "Smart_car"，才能连上来放歌
+#   3) 拉起蓝牙音频（bluealsa A2DP Sink + bluealsa-aplay -> 车机喇叭）
+#
+# 名称可用 SMARTCAR_BT_NAME 覆盖（默认 Smart_car）。
+set -u
+
+LOG=/var/log/smartcar-bt.log
+BTCTL=/userdata/smart_car/bt-ctl
+AGENT=/userdata/smart_car/bt-agent
+NAME="${SMARTCAR_BT_NAME:-Smart_car}"
+
+log() { echo "$(date '+%m-%d %H:%M:%S') bt-boot-setup: $*" >> "$LOG"; }
+
+# ---- 1) 等 hci0 ----
+i=0
+while [ ! -e /sys/class/bluetooth/hci0 ] && [ $i -lt 100 ]; do
+    sleep 0.2
+    i=$((i + 1))
+done
+if [ ! -e /sys/class/bluetooth/hci0 ]; then
+    log "等不到 hci0，放弃"
+    exit 0
+fi
+log "hci0 就绪（等待 $((i / 5)) 秒）"
+
+# ---- 2) 配置适配器 ----
+st=""
+try=1
+while [ $try -le 3 ]; do
+    bluetoothctl power on          >/dev/null 2>&1
+    bluetoothctl system-alias "$NAME" >/dev/null 2>&1
+    bluetoothctl pairable on       >/dev/null 2>&1
+    bluetoothctl discoverable on   >/dev/null 2>&1
+    st=$(bluetoothctl show 2>/dev/null | sed -n 's/.*Powered: //p' | head -1)
+    [ "$st" = "yes" ] && break
+    try=$((try + 1))
+    sleep 2
+done
+
+alias_now=$(bluetoothctl show 2>/dev/null | sed -n 's/.*Alias: //p' | head -1)
+disc=$(bluetoothctl show 2>/dev/null | sed -n 's/.*Discoverable: //p' | head -1)
+pair=$(bluetoothctl show 2>/dev/null | sed -n 's/.*Pairable: //p' | head -1)
+log "适配器: powered=${st:-?} alias='$alias_now' discoverable=${disc:-?} pairable=${pair:-?}"
+
+# ---- 3) 蓝牙音频 ----
+if [ -x "$BTCTL" ]; then
+    "$BTCTL" audio-on >> "$LOG" 2>&1
+    # 手机音频别因为本地静音而没声
+    for ctl in Master Speaker Headphone PCM; do
+        amixer -q sset "$ctl" 100% unmute 2>/dev/null || true
+    done
+    log "蓝牙音频已就绪（手机连上后放歌即可从车机喇叭出声）"
+else
+    log "$BTCTL 不存在，蓝牙音频未启动"
+fi
+
+# ---- 3a) 关掉 WiFi 省电（治"蓝牙音乐时不时卡一下"，2026-10-13 加）----
+#
+# 【为什么】
+# 这板子的 WiFi 与蓝牙是**同一颗 Realtek RTL8733BU**（USB 0bda:b733，
+# 驱动 rtl8733bu，带 rtw_btcoex_enable），**共用一套射频/天线**。
+# 而 WiFi 省电（PS, Power Save）打开时，网卡会周期性"睡觉"：
+# 睡的时候 AP 缓存的包会在醒来瞬间**突发**收下来 —— 这一下就把射频占住，
+# 蓝牙 A2DP 在这几百毫秒里收不到包，听感就是"时不时卡一下"（不是断连）。
+# iwconfig/iw 实测开机默认就是 `Power save: on`，所以要显式关掉。
+#
+# 关掉之后 WiFi 常态在线、收发更平滑，留给蓝牙的空口更连续。
+# 代价是 WiFi 待机功耗略升 —— 车机是常电，可以接受。
+for i in 1 2 3; do                      # 网卡可能还没 ready，重试几次
+    iw dev wlan0 set power_save off 2>/dev/null && break
+    sleep 2
+done
+ps_now=$(iw dev wlan0 get power_save 2>/dev/null)
+log "WiFi 省电: ${ps_now:-未知}（目标 off，治蓝牙音频卡顿）"
+
+# ---- 3b) A2DP Sink 端点看门狗（2026-10-13 加，实际启动在第 4/4b 步）----
+#
+# 【为什么必须有】
+# bluealsa 提供的就是"车机是个音箱（A2DP Sink）"这个身份。它一没了，
+# 手机侧看不到音频接收端，就会把 ACL 也断掉 —— 用户看到的是"能连但会掉"。
+# 实测证据（dmesg）：一串 L2CAP disconn for PSM 0x19/0x1b（AVDTP/A2DP 拆除）之后
+# 紧跟 `HCI Disconnect, handle 0004, reason 0x13`（远端主动断）。
+#
+# 而**应用自己的启动路径**里有一句 `bt-ctl audio-release`（见 Audio.cpp
+# releaseAlsaForLocal 的 "启动时让出声卡"），它在"以为手机没连着"时会把
+# 还在连的链路整个拆掉。bt-ctl 已经改成不杀 bluealsa（只停 aplay），
+# 这里再加一道独立于应用的兜底。
+#
+# ⚠️ 兜底**不能**写成"setsid 一个一次性循环" —— 那种看门狗自己没了也不会有人知道
+#    （本项目已经踩过这种"假守护"）。所以交给 bt-agent 的 watch-all：
+#    一个永不退出的循环里同时看住 agent 会话和 bluealsa。
+# 具体启动顺序见下面的第 4) / 4b) 步：先起 agent，再起看门狗。
+
+# ---- 4) 常驻配对 agent ----
+#
+# 没有任何 agent 注册时，BlueZ 收到配对/授权请求会直接拒绝，日志是
+#   "Authentication attempt without agent"
+# 而后台脚本用 `bluetoothctl --agent X pair Y` 是**不够**的：那种一次性调用
+# 一结束 agent 就注销了，正好赶在手机随后的 A2DP 入连接之前消失。
+# 所以这里起的是常驻会话（bt-agent）。
+if [ -x "$AGENT" ]; then
+    "$AGENT" start >> "$LOG" 2>&1
+    log "常驻 agent 已启动"
+fi
+
+# ---- 4b) 看门狗（agent 会话 + bluealsa 端点）----
+if [ -x "$AGENT" ]; then
+    setsid "$AGENT" watch-all >> "$LOG" 2>&1 < /dev/null &
+    log "看门狗已启动（agent 会话 + bluealsa 端点，同一个循环里）"
+fi
+
+# ---- 5) 校验/兜底 trusted（解决"配上了但连不上/放歌没声"）----
+#
+# BlueZ 收到手机的 A2DP 入连接时会先问 agent"是否授权这个服务"
+# （profiles/audio/a2dp.c:confirm_cb -> btd_request_authorization）。
+# bluetoothctl 的普通 agent 只会打印 "Accept pairing (yes/no):" 等**人敲键盘**，
+# 车机没人敲，实测 41 秒后连接被拒，手机侧就是"连接失败"。
+# 而 src/adapter.c:process_auth_queue() 的第一条分支是：
+#     if (btd_device_is_trusted(device) == TRUE) { 直接放行 }
+# 所以设备是 trusted，整个授权询问就被跳过。
+#
+# **真正的设置已经由 S39 阶段的 bt-keystore-init 在 bluetoothd 启动前
+# 写进配置文件了**（那样没有竞态）。这里只做校验和兜底。
+# 注意：不要以为 `bluetoothctl trust X` 成功就真成功了 ——
+# 设备还没被 bluetoothd 读进来时它会失败但**依然返回 0**，
+# 所以必须回查 `info` 里的 Trusted 字段。
+for d in /userdata/lib/bluetooth/*/*/; do
+    [ -f "${d}info" ] || continue
+    grep -q '^\[LinkKey\]' "${d}info" 2>/dev/null || continue
+    addr=$(basename "$d")
+    case "$addr" in
+        *:*) ;;
+        *) continue ;;
+    esac
+    if grep -q '^Trusted=true' "${d}info" 2>/dev/null; then
+        log "已配对设备 $addr 已是 trusted"
+    else
+        bluetoothctl trust "$addr" >/dev/null 2>&1
+        if bluetoothctl info "$addr" 2>/dev/null | grep -qi 'Trusted: yes'; then
+            log "已补标 trusted: $addr"
+        else
+            log "警告: $addr 的 trusted 这次没设上（重启后由 S39 修好）"
+        fi
+    fi
+done
+
+# 让它一直可被发现：默认 180 秒后会自动关闭，手机就再也搜不到了
+bluetoothctl discoverable-timeout 0 >/dev/null 2>&1
+
+exit 0

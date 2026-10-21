@@ -1,0 +1,56 @@
+import os
+import sys
+import rtconfig
+
+if os.getenv('RTT_ROOT'):
+    RTT_ROOT = os.getenv('RTT_ROOT')
+else:
+    RTT_ROOT = os.path.normpath(os.getcwd() + '/../../..')
+
+sys.path = sys.path + [os.path.join(RTT_ROOT, 'tools'), os.path.join(os.getcwd(), '../tools')]
+from building import *
+
+TARGET = 'rtthread.' + rtconfig.TARGET_EXT
+
+# ---------------------------------------------------------------------------
+# Generate the linker script from gcc_link.ld.S (it carries C preprocessor
+# arithmetic for the heap/stack split, and keeps the memory map readable).
+# ---------------------------------------------------------------------------
+ld_dst = 'gcc_link.ld'
+cmd = '{cppcmd} -P -C -E -I. -D__ASSEMBLY__ {ld_src} -o {ld_dst}'.format(
+    cppcmd=os.path.join(rtconfig.EXEC_PATH, 'arm-none-eabi-gcc'),
+    ld_src=rtconfig.LINK_SCRIPT,
+    ld_dst=ld_dst)
+if os.system(cmd) != 0:
+    print('failed to generate linker script %s' % ld_dst)
+    sys.exit(255)
+Depends(TARGET, ld_dst)
+
+rtconfig.LFLAGS += ' -T %s' % ld_dst
+
+env = Environment(tools=['mingw'],
+                  AS=rtconfig.AS, ASFLAGS=rtconfig.AFLAGS,
+                  CC=rtconfig.CC, CCFLAGS=rtconfig.CFLAGS,
+                  AR=rtconfig.AR, ARFLAGS='-rc',
+                  LINK=rtconfig.LINK, LINKFLAGS=rtconfig.LFLAGS)
+env.PrependENVPath('PATH', rtconfig.EXEC_PATH)
+
+Export('RTT_ROOT')
+Export('rtconfig')
+
+# ---------------------------------------------------------------------------
+# has_libcpu=False  =>  building.py *includes* libcpu (it picks
+# libcpu/arm/cortex-m0 from rtconfig.ARCH/rtconfig.CPU).
+#
+# All of RT-Thread's own components (finsh/msh, DFS, network, POSIX, ...) are
+# removed from the build entirely: this target has 32 KiB of RAM in total and
+# uses the kernel only (threads, semaphore/mutex/mailbox, tick).
+# ---------------------------------------------------------------------------
+REMOVE_COMPONENTS = ['aupipe', 'benchmark', 'dfs', 'fal', 'finsh', 'fsck_fat',
+                     'legacy', 'libc', 'lwp', 'net', 'ota', 'rpmsg_cmd',
+                     'system', 'utilities', 'vbus', 'vmm']
+
+objs = PrepareBuilding(env, RTT_ROOT, has_libcpu=False,
+                       remove_components=REMOVE_COMPONENTS)
+
+DoBuilding(TARGET, objs)

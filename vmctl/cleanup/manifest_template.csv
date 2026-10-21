@@ -1,0 +1,2 @@
+seq,batch,category,source_path,size_bytes,md5,target_path,status,note
+1,1,B2,D:\EXAMPLE\build_out\ui_backup_v2_ok\mainwindow.cpp,12345,00000000000000000000000000000000,E:\EXAMPLE\backups_20261019\build_out__ui_backup_v2_ok\mainwindow.cpp,COPIED,THIS-IS-AN-EXAMPLE-ROW-DELETE-IT

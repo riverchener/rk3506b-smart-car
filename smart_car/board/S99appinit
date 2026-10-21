@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# Smart_car 车载系统开机自启动
+# 安装位置：/etc/init.d/S99appinit
+#
+### BEGIN INIT INFO
+# Provides:          smartcar
+# Required-Start:    mountvirtfs
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Smart car HMI autostart
+### END INIT INFO
+
+APP_DIR=/userdata/smart_car
+APP=$APP_DIR/Smart_in-car_entertainment
+LOG=/var/log/smartcar.log
+
+export XDG_RUNTIME_DIR=/var/run
+export WAYLAND_DISPLAY=wayland-0
+# wayland-egl 客户端后端在这个 buildroot 里没编出来，强制走 shm 后端避免报错刷屏
+export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+export QT_QPA_PLATFORM=wayland
+# 关掉 Qt bearer 网络插件的噪声日志（"No carrier"）
+export QT_LOGGING_RULES="qt.network.ssl.warning=false;qt.qpa.*=false"
+# 视频搜索目录（U盘 / TF卡 挂载点由 /etc/init.d 挂载脚本处理）
+export SMARTCAR_VIDEO_DIRS=/mnt/udisk:/mnt/sdcard:/userdata/Videos
+
+# 统一配置（城市/地图中心/外设引脚/界面缩放都在这里改）
+[ -f /etc/smartcar.conf ] && . /etc/smartcar.conf
+
+start() {
+    # 1) 加载外设驱动（DHT11 数据脚 GPIO1_C3=51，SR04 TRIG/ECHO=54/55，蜂鸣器 A12=gpio32）
+    #    buzzer_active_low=1：低电平触发模块，上电输出【高电平】保持静音
+    if [ -f "$APP_DIR/smartcar_hw.ko" ] && [ ! -e /dev/mydht11 ]; then
+        insmod "$APP_DIR/smartcar_hw.ko" \
+            dht11_pin=51 sr04_trig_pin=54 sr04_echo_pin=55 \
+            buzzer_pin=32 buzzer_active_low=1 \
+            2>/dev/null && echo "smartcar_hw.ko loaded"
+    fi
+
+    # 2) 等 weston（Wayland 合成器）就绪
+    counter=0
+    while [ ! -e "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ] && [ $counter -lt 100 ]; do
+        sleep 0.1
+        counter=$((counter + 1))
+    done
+
+    # 3) 关掉出厂 systemui，避免和全屏应用抢画面
+    killall systemui controlcenter dynamicIsland 2>/dev/null
+
+    # 4) 启动车载应用
+    if [ -x "$APP" ]; then
+        cd "$APP_DIR" || exit 1
+        "$APP" >> "$LOG" 2>&1 &
+        echo "smart car app started, log: $LOG"
+    else
+        echo "ERROR: $APP not found"
+    fi
+}
+
+stop() {
+    killall Smart_in-car_entertainment 2>/dev/null
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    *)       echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit 0

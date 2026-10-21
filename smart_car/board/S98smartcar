@@ -1,0 +1,183 @@
+#!/bin/sh
+# Smart_car autostart: AMP sensor bridge (M0) + buzzer mute + Qt HMI.
+#
+# The environment sensors (DHT11 / SR04 / buzzer) are owned and sampled by the
+# Cortex-M0 firmware since the AMP rework:
+#   M0  ->  rpmsg service "rpmsg-smartcar"  ->  sc_sensors.ko  ->  /dev/mydht11
+#                                                                /dev/mysr04
+#                                                                /dev/mybuzzer
+# so sc_sensors.ko replaces smartcar_hw.ko here.  If sc_sensors cannot attach
+# (for example the M0 is not running because the board was only warm-rebooted),
+# we fall back to the old Linux-side driver so the car system still works.
+#
+# QT_QPA_PLATFORM=wayland is REQUIRED -- the rootfs has no eglfs plugin, so Qt
+# otherwise dies with: Could not find the Qt platform plugin "eglfs".
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+# ---------------------------------------------------------------- 启动日志
+# 开机时 /var/log 是 tmpfs、/userdata 可能还没挂上，所以日志先写 /tmp，
+# 挂载成功后再切到 /userdata（下次冷启动可以直接看这个文件定位问题）。
+BOOTLOG=/tmp/smartcar-boot.log
+log() { echo "$(date '+%H:%M:%S') $*" >> "$BOOTLOG" 2>/dev/null; }
+
+# ---------------------------------------------------------------- 等 /userdata
+# rcS 是顺序执行 /etc/init.d/S??*，本脚本排到 S98 时 ubi7 的 attach/mount 有
+# 可能还没完成（特别是刚刷完机的第一次开机）。以前这里直接
+# `cd /userdata/smart_car || return 1` 就退出了，表现是：模块没装、应用没起、
+# 连 /var/log/smartcar.log 都不生成 —— 而原厂 systemui 照常显示。
+ensure_userdata() {
+    i=0
+    while [ $i -lt 150 ]; do
+        grep -q ' /userdata ' /proc/mounts 2>/dev/null && return 0
+        [ -d /userdata/smart_car ] && return 0
+        [ $i -eq 20 ] && { mount /userdata 2>/dev/null; log "尝试 mount /userdata"; }
+        [ $i -eq 60 ] && { mount-helper 2>/dev/null; log "尝试 mount-helper"; }
+        sleep 0.2
+        i=$((i + 1))
+    done
+    return 1
+}
+log "---- S98smartcar start ----"
+if ensure_userdata; then
+    BOOTLOG=/userdata/smartcar-boot.log
+    log "/userdata 已挂载"
+else
+    log "!! /userdata 30 秒内未挂载，继续尝试"
+fi
+
+CONF=/userdata/smart_car/smartcar.conf
+# 与 smartcar_hw.ko 的驱动默认值一致（driver: dht11 51 / trig 54 / echo 55 / buzzer 56）
+PIN=51
+TRIG=54
+ECHO=55
+BUZZPIN=56
+BUZZ=1
+[ -r "$CONF" ] && . "$CONF"
+# 注意变量名是 ..._GPIO（见 smartcar.conf）。以前这里读成 SMARTCAR_DHT11_PIN，
+# 配置里根本没这个变量，于是 PIN 一直用脚本里写死的 52，与文档/配置里的 51 不符。
+[ -n "$SMARTCAR_DHT11_GPIO" ] && PIN=$SMARTCAR_DHT11_GPIO
+[ -n "$SMARTCAR_SR04_TRIG_GPIO" ] && TRIG=$SMARTCAR_SR04_TRIG_GPIO
+[ -n "$SMARTCAR_SR04_ECHO_GPIO" ] && ECHO=$SMARTCAR_SR04_ECHO_GPIO
+[ -n "$SMARTCAR_BUZZER_GPIO" ] && BUZZPIN=$SMARTCAR_BUZZER_GPIO
+[ -n "$SMARTCAR_BUZZER_ACTIVE_LOW" ] && BUZZ=$SMARTCAR_BUZZER_ACTIVE_LOW
+
+export XDG_RUNTIME_DIR=/var/run
+export WAYLAND_DISPLAY=wayland-0
+export QT_QPA_PLATFORM=wayland
+export QT_QUICK_BACKEND=software
+export QT_QPA_FONTDIR=/usr/share/fonts
+export WAYLANDSINK_FORCE_DMABUF=1
+export LD_LIBRARY_PATH=/userdata/smart_car
+
+# ---------------------------------------------------------------- locale (重要!)
+# Qt 的 QString <-> 本地 8bit 转换用的是 **locale 的 codec**（QFile::encodeName、
+# QString::toLocal8Bit、QUrl::fromLocalFile 都走它）。没有 LANG 时 glibc 报
+# ANSI_X3.4-1968，Qt 把中文转成 '?'/latin1 字节，于是：
+#   - 界面与日志里的中文全变成 ??????（乱码）
+#   - 中文文件名的音视频打不开：GStreamer ... "Resource not found."
+# 系统本来在 /etc/profile.d/lang.sh 里定了 en_US.UTF-8，但那是 **login shell** 才读的，
+# init 直接拉起的进程拿不到 —— 手工从 adb shell 启动 app 就正常，就是这个原因。
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+# /dev/mybuzzer write(): 2 bytes, byte[1] != 0 means "sound"; {0,0} = silence.
+# Done here so a crashed app cannot leave the buzzer screaming.
+silence_buzzer() {
+    [ -e /dev/mybuzzer ] || return 0
+    printf '\000\000' > /dev/mybuzzer 2>/dev/null && echo -n "[buzzer muted] "
+}
+
+load_sensors() {
+    # 若 M0（AMP）在跑，外设归 M0 所有，必须卸掉抢脚的旧驱动 smartcar_hw。
+    if lsmod | grep -q '^smartcar_hw'; then
+        rmmod smartcar_hw 2>/dev/null && echo -n "[smartcar_hw unloaded] "
+    fi
+
+    if lsmod | grep -q '^sc_sensors'; then
+        return 0
+    fi
+
+    # 显式把脚号传进去：模块默认是 52，但配置才是唯一来源。
+    # dht11_local=1 = DHT11 由 A7 内核 bit-bang（M0 只管 SR04/蜂鸣器）。
+    if err=$(insmod /userdata/smart_car/sc_sensors.ko dht11_local=1 dht11_pin=$PIN 2>&1); then
+        log "sc_sensors 已加载: M0 via rpmsg, DHT11 on gpio $PIN"
+        echo -n "[AMP sensors: M0 via rpmsg, DHT11 on gpio $PIN] "
+        return 0
+    fi
+    log "sc_sensors 加载失败: $err"
+
+    echo -n "[sc_sensors failed, falling back to smartcar_hw] "
+    log "回退到 smartcar_hw.ko"
+    # 四个脚都显式传进去，脚号只认 /etc/smartcar.conf 一个来源
+    if err=$(insmod /userdata/smart_car/smartcar_hw.ko \
+        dht11_pin=$PIN sr04_trig_pin=$TRIG sr04_echo_pin=$ECHO \
+        buzzer_pin=$BUZZPIN buzzer_active_low=$BUZZ 2>&1); then
+        log "smartcar_hw 已加载（回退路径）"
+    else
+        log "!! smartcar_hw 也加载失败: $err"
+        echo -n "[insmod failed] "
+    fi
+}
+
+start() {
+    echo -n "starting smartcar... "
+
+    load_sensors
+    silence_buzzer
+
+    counter=0
+    while [ ! -e "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ] && [ $counter -lt 100 ]; do
+        sleep 0.1
+        counter=$((counter + 1))
+    done
+
+    # 关掉出厂 Qt 桌面（720x1280 竖屏构图，会在车机应用之前先画一屏，
+    # 其下拉控制中心还会抢触摸导致卡死）。S50systemui 已禁用作第一道防线，
+    # 这里再补一刀，防止别处把它拉起来。
+    # 同样用 pkill -f（killall 对长名字不可靠）。
+    pkill -9 -f systemui 2>/dev/null
+    pkill -9 -f controlcenter 2>/dev/null
+    pkill -9 -f dynamicIsland 2>/dev/null
+
+    # 关键：启动前先确认没有别的实例还在跑（否则两个实例会抢蓝牙/音频）
+    if pgrep -f Smart_in-car_entertainment >/dev/null 2>&1; then
+        echo -n "[发现残留实例，先清理] "
+        pkill -9 -f Smart_in-car_entertainment 2>/dev/null
+        sleep 1
+    fi
+    if ! pidof Smart_in-car_entertainment >/dev/null 2>&1; then
+        cd /userdata/smart_car || { log "!! cd /userdata/smart_car 失败"; return 1; }
+        /userdata/smart_car/Smart_in-car_entertainment > /var/log/smartcar.log 2>&1 &
+        log "车机程序已启动 pid=$!"
+    else
+        log "车机程序已在运行，跳过启动"
+    fi
+    echo "done."
+}
+
+stop() {
+    echo -n "stopping smartcar... "
+    # 用 pkill -f 而不是 killall：本应用进程名 Smart_in-car_entertainment
+    # **超过 15 个字符**，内核会把 comm 截断（TASK_COMM_LEN=16），
+    # `killall Smart_in-car_entertainment` 按完整名匹配**永远失败**。
+    # 后果：每次 restart 都杀不掉旧实例 -> 出现"幽灵实例" ->
+    # 两个实例同时驱动蓝牙互相打断配对（实测踩过：配对交互被搅断，
+    # 手机报"PIN 码/通行密钥不正确"，怎么改代码都没用）。
+    # pkill -f 匹配完整命令行，能可靠杀干净。
+    pkill -9 -f Smart_in-car_entertainment 2>/dev/null
+    sleep 1
+    if pgrep -f Smart_in-car_entertainment >/dev/null 2>&1; then
+        echo -n "[警告: 仍有残留实例] "
+    fi
+    silence_buzzer
+    echo "done."
+}
+
+case "$1" in
+    start) start ;;
+    stop)  stop ;;
+    restart|reload) stop; sleep 1; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0

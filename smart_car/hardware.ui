@@ -1,0 +1,494 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Hardware</class>
+ <widget class="QMainWindow" name="Hardware">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1024</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MainWindow</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">background-color: rgb(18, 25, 38);
+
+</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <widget class="QWidget" name="widget" native="true">
+    <property name="geometry">
+     <rect>
+      <x>20</x>
+      <y>80</y>
+      <width>291</width>
+      <height>181</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">border-radius: 30px;
+background-color: rgb(32, 42, 58);
+border: 2px solid rgb(52, 66, 88);
+
+
+
+
+
+</string>
+    </property>
+    <widget class="QLabel" name="Templabel">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>140</y>
+       <width>51</width>
+       <height>21</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 12pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string> 温度</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Temp_label">
+     <property name="geometry">
+      <rect>
+       <x>100</x>
+       <y>26</y>
+       <width>110</width>
+       <height>126</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>25</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>20</y>
+       <width>91</width>
+       <height>111</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">
+image: url(:/images/temp.png);</string>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Temp_label_2">
+     <property name="geometry">
+      <rect>
+       <x>216</x>
+       <y>40</y>
+       <width>62</width>
+       <height>110</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>℃</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="widget_2" native="true">
+    <property name="geometry">
+     <rect>
+      <x>340</x>
+      <y>80</y>
+      <width>291</width>
+      <height>181</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">border-radius: 30px;
+background-color: rgb(32, 42, 58);
+border: 2px solid rgb(52, 66, 88);
+
+
+</string>
+    </property>
+    <widget class="QLabel" name="label_2">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>20</y>
+       <width>91</width>
+       <height>111</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">image: url(:/images/humi.png);</string>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Temp_label_4">
+     <property name="geometry">
+      <rect>
+       <x>226</x>
+       <y>40</y>
+       <width>62</width>
+       <height>110</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>%</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Humilabel">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>140</y>
+       <width>41</width>
+       <height>21</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 12pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>湿度</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Humi_label">
+     <property name="geometry">
+      <rect>
+       <x>110</x>
+       <y>26</y>
+       <width>110</width>
+       <height>126</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>50</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="widget_3" native="true">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>320</y>
+      <width>451</width>
+      <height>276</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">border-radius: 30px;
+background-color: rgb(32, 42, 58);
+border: 2px solid rgb(52, 66, 88);
+
+
+</string>
+    </property>
+    <widget class="QLabel" name="label_3">
+     <property name="geometry">
+      <rect>
+       <x>31</x>
+       <y>20</y>
+       <width>91</width>
+       <height>111</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">
+image: url(:/images/car.png);</string>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Temp_label_5">
+     <property name="geometry">
+      <rect>
+       <x>350</x>
+       <y>30</y>
+       <width>91</width>
+       <height>121</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>cm</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Sr04labal">
+     <property name="geometry">
+      <rect>
+       <x>48</x>
+       <y>144</y>
+       <width>60</width>
+       <height>24</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 12pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>距离</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Sr04_label">
+     <property name="geometry">
+      <rect>
+       <x>150</x>
+       <y>46</y>
+       <width>150</width>
+       <height>100</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>25.51</string>
+     </property>
+    </widget>
+    <widget class="QCheckBox" name="bgAlarmCheck">
+     <property name="geometry">
+      <rect>
+       <x>22</x>
+       <y>172</y>
+       <width>300</width>
+       <height>66</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">QCheckBox {
+color: rgb(225, 238, 250);
+font: 16pt &quot;Agency FB&quot;;
+spacing: 14px;
+padding: 6px 12px;
+border-radius: 10px;
+background: rgba(255, 255, 255, 16);
+}
+QCheckBox:hover {
+background: rgba(255, 255, 255, 34);
+}
+QCheckBox::indicator {
+width: 38px;
+height: 38px;
+border-radius: 7px;
+border: 2px solid rgb(110, 145, 180);
+background: rgb(24, 34, 48);
+}
+QCheckBox::indicator:checked {
+background: rgb(70, 200, 130);
+border: 2px solid rgb(120, 235, 165);
+}</string>
+     </property>
+     <property name="text">
+      <string>后台保持近距离警告</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="bgAlarmHint">
+     <property name="geometry">
+      <rect>
+       <x>34</x>
+       <y>240</y>
+       <width>410</width>
+       <height>32</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgba(150, 175, 205, 230);
+/* 用 px 而不用 pt：pt 会被 DPI/字号缩放影响，实测在 1.2 倍缩放后
+   这一行提示被纵向压扁成半截字（同一个控件在 offscreen 渲染里是好的，
+   说明和字号换算有关）。px 是绝对值，不会再被换算放大。 */
+font-size: 15px;
+background: transparent;</string>
+     </property>
+     <property name="text">
+      <string>开启后退出本页，靠近仍会报警</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="widget_4" native="true">
+    <property name="geometry">
+     <rect>
+      <x>520</x>
+      <y>320</y>
+      <width>451</width>
+      <height>181</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">border-radius: 30px;
+background-color: rgb(32, 42, 58);
+border: 2px solid rgb(52, 66, 88);
+
+
+</string>
+    </property>
+    <widget class="QLabel" name="buzzer">
+     <property name="geometry">
+      <rect>
+       <x>80</x>
+       <y>30</y>
+       <width>120</width>
+       <height>120</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">image: url(:/images/buzzer.png);</string>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+    <widget class="QLabel" name="led">
+     <property name="geometry">
+      <rect>
+       <x>260</x>
+       <y>30</y>
+       <width>120</width>
+       <height>120</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">image: url(:/images/led.png);</string>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="widget_5" native="true">
+    <property name="geometry">
+     <rect>
+      <x>660</x>
+      <y>80</y>
+      <width>341</width>
+      <height>181</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">border-radius: 30px;
+background-color: rgb(32, 42, 58);
+border: 2px solid rgb(52, 66, 88);
+
+
+</string>
+    </property>
+    <widget class="QLabel" name="label_5">
+     <property name="geometry">
+      <rect>
+       <x>20</x>
+       <y>20</y>
+       <width>90</width>
+       <height>110</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">image: url(:/images/air.png);</string>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+    <widget class="QLabel" name="Humilabel_3">
+     <property name="geometry">
+      <rect>
+       <x>20</x>
+       <y>140</y>
+       <width>81</width>
+       <height>21</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">
+color: rgb(120, 230, 130);
+font: 12pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>空气质量</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="fumes_label">
+     <property name="geometry">
+      <rect>
+       <x>130</x>
+       <y>26</y>
+       <width>110</width>
+       <height>126</height>
+      </rect>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: rgb(120, 200, 255);
+font: 34pt &quot;Agency FB&quot;;</string>
+     </property>
+     <property name="text">
+      <string>--</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QPushButton" name="back1">
+    <property name="geometry">
+     <rect>
+      <x>20</x>
+      <y>10</y>
+      <width>31</width>
+      <height>28</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">QPushButton {
+ background-color:transparent;
+ border-radius:10px;
+ border-image: url(:/images/back1.png);
+}</string>
+    </property>
+    <property name="text">
+     <string/>
+    </property>
+   </widget>
+  </widget>
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+     <width>1024</width>
+     <height>26</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

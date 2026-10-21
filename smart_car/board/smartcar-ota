@@ -1,0 +1,759 @@
+#!/bin/sh
+# =============================================================================
+# smartcar-ota —— Smart_car 车机 OTA 升级客户端（板端，POSIX sh）
+# =============================================================================
+# 目标板：ATK-DLRK3506B（RK3506B，Linux 6.1，busybox ash）
+#
+# 设计要点（为什么这么写）：
+#   1. 只用板子上**真实存在**的东西：busybox sh / wget / md5sum / tar / awk，
+#      不依赖 python、不依赖 curl（板上 curl 有但 wget 更稳）、不需要编译。
+#   2. **原子替换**：新版本先落到 /userdata/ota/tmp/<ver>/，校验通过后再
+#      写 /userdata/smart_car/.Smart_in-car_entertainment.new（同分区）+ mv 覆盖。
+#      同分区 rename 是原子的 —— 掉电只会出现"旧的"或"新的"，不会是半个文件。
+#   3. **升级前留 slot**：老版本被复制到 /userdata/ota/slots/<ver>/ 并写 meta，
+#      任何一步失败都能自动回滚（rollback 只需 cp + mv）。
+#   4. **升级后自证**：不只看"文件 md5 对不对"，还要看
+#      /proc/<pid>/exe 指向的文件 md5 == 新版本 md5，
+#      并且从**运行中进程的可执行文件**里 grep 出版本串 —— 证明跑起来的确实是新的。
+#   5. 版本号来自 ELF 里的 `SMARTCAR_OTA_VERSION=vX.Y.Z`（见 ota_version.h），
+#      所以版本比对、装机校验、运行校验用的是同一个事实来源。
+#   6. 日志写 /var/log/smartcar-ota.log（/var/log 是 tmpfs，掉电即失，但
+#      同一份内容也会落到 /userdata/ota/ota.log 里，重启后仍可查）。
+#
+# 空间注意：本板 **根文件系统只剩 ~1.6MB**，所有下载/解包一律放 /userdata。
+#
+# 用法：
+#   smartcar-ota status              当前安装版本 / 正在运行的版本 / 各 slot
+#   smartcar-ota check               拉 manifest 比对版本，只报告不安装
+#   smartcar-ota update              查 → 下 → 校验 → 装 → 重启 → 自证（失败自动回滚）
+#   smartcar-ota update --force      忽略"版本相同"直接重装（用于修复损坏的安装）
+#   smartcar-ota local <dir>         离线升级：从本地目录读 manifest.json + 包（不联网）
+#   smartcar-ota rollback [版本]     回滚到上一个（或指定）slot
+#   smartcar-ota verify              校验"正在运行的进程"== "磁盘上的文件"== 版本串
+#   smartcar-ota firmware check      固件层（mtd4/mtd6）只检查不写
+#   smartcar-ota firmware dryrun     固件层**试运行**：校验+备份+打印将要写的分区与 md5，不擦不写
+#   smartcar-ota firmware flash      固件层**真写**（需要 --yes 二次确认；默认拒绝）
+# =============================================================================
+
+set -u
+
+# ---------------------------------------------------------------- 可配置项
+# 会被 adb reverse tcp:18080 tcp:18080 映射到 PC/VM 上的静态 HTTP 服务
+MANIFEST_URL="${SMARTCAR_OTA_URL:-http://127.0.0.1:18080/ota/manifest.json}"
+
+APP_DIR="${SMARTCAR_APP_DIR:-/userdata/smart_car}"
+APP_NAME="Smart_in-car_entertainment"
+APP="$APP_DIR/$APP_NAME"
+
+OTA_ROOT="${SMARTCAR_OTA_ROOT:-/userdata/ota}"
+TMP_DIR="$OTA_ROOT/tmp"
+SLOT_DIR="$OTA_ROOT/slots"
+FWBK_DIR="$OTA_ROOT/fwbackup"
+META="$OTA_ROOT/manifest.json"
+
+INITD="/etc/init.d/S98smartcar"
+LOG="/var/log/smartcar-ota.log"
+PERSIST_LOG="$OTA_ROOT/ota.log"
+
+WGET_TIMEOUT=30
+WGET_TRIES=3
+# 重启后等应用起来的轮询
+BOOT_TRIES=25
+BOOT_INTERVAL=1
+
+VERSION_TAG="SMARTCAR_OTA_VERSION="
+
+# ---------------------------------------------------------------- 日志
+mkdir -p "$OTA_ROOT" 2>/dev/null
+: > "$LOG" 2>/dev/null || LOG=/dev/null
+rm -f "$PERSIST_LOG" 2>/dev/null
+
+# 两条朴素写入：/var/log 那份给人看（tmpfs，重启即失），
+# /userdata/ota/ota.log 那份给"重启后回溯"用 —— 升级失败最常需要看的就是重启前的日志。
+log() {
+    _ts=$(date '+%Y-%m-%d %H:%M:%S')
+    _line="$_ts $*"
+    printf '%s\n' "$_line" >> "$LOG" 2>/dev/null
+    printf '%s\n' "$_line" >> "$PERSIST_LOG" 2>/dev/null
+    printf '%s\n' "$_line"
+}
+log_raw() {   # 只进日志不进 stdout（给大段命令输出用）
+    _ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '%s %s\n' "$_ts" "$*" >> "$LOG" 2>/dev/null
+    printf '%s %s\n' "$_ts" "$*" >> "$PERSIST_LOG" 2>/dev/null
+}
+
+# 把一条命令的输出逐行加前缀写进日志（只进日志，不进 stdout）
+run_pipe() {   # run_pipe <prefix> <cmd...>
+    _pfx="$1"; shift
+    "$@" 2>/dev/null | while IFS= read -r _h; do log_raw "${_pfx}${_h}"; done
+}
+
+die() { log "ERROR: $*"; exit 1; }
+
+# ---------------------------------------------------------------- JSON 取值
+# 板子上没有 jq，manifest 是**我们自己生成的固定格式**，用 sed 取值足够且可预测。
+# 注意：值里不允许出现双引号（生成端保证）。
+json_str() {  # json_str <file> <key>
+    sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -1
+}
+json_num() {  # json_num <file> <key>
+    sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -1
+}
+
+# ---------------------------------------------------------------- 版本比较
+# 版本号只允许数字和点。返回 0 表示 $1 < $2（需要升级）。
+ver_lt() {
+    _a="$1"; _b="$2"
+    _i=1
+    while [ $_i -le 4 ]; do
+        _x=$(printf '%s' "$_a" | cut -d. -f$_i)
+        _y=$(printf '%s' "$_b" | cut -d. -f$_i)
+        [ -z "$_x" ] && _x=0
+        [ -z "$_y" ] && _y=0
+        # 去掉可能的前导零，避免 [ ] 把它当八进制
+        _x=$(printf '%s' "$_x" | sed 's/^0*//'); [ -z "$_x" ] && _x=0
+        _y=$(printf '%s' "$_y" | sed 's/^0*//'); [ -z "$_y" ] && _y=0
+        [ "$_x" -lt "$_y" ] && return 0
+        [ "$_x" -gt "$_y" ] && return 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- 版本取证
+# 从任意 ELF 文件里抠出版本串（busybox 的 strings 可能没有，用 grep -a 兜底）
+file_version() {   # file_version <file>
+    [ -f "$1" ] || { echo "?"; return; }
+    if command -v strings >/dev/null 2>&1; then
+        strings "$1" 2>/dev/null | sed -n "s/.*$VERSION_TAG\([^ ]*\).*/\1/p" | head -1
+    else
+        grep -ao "$VERSION_TAG[0-9A-Za-z._-]*" "$1" 2>/dev/null \
+            | head -1 | sed "s/^$VERSION_TAG//"
+    fi
+}
+
+# 去掉可选的 v 前缀：ELF 里编进去的是 "v1.1.0"，manifest 里是 "1.1.0"。
+# 两处必须归一化后再比，否则 ver_lt 会把 'v1' 当数字而报错。
+norm_ver() { printf '%s' "$1" | sed 's/^v//'; }
+
+# 正在运行的进程的**可执行文件**版本（/proc/<pid>/exe 跟随符号链接到真实文件）
+running_pid() { pidof "$APP_NAME" 2>/dev/null | awk '{print $1}'; }
+
+running_exe() {
+    _p=$(running_pid)
+    [ -n "$_p" ] || return 1
+    readlink "/proc/$_p/exe" 2>/dev/null
+}
+
+running_version() {
+    _e=$(running_exe) || { echo "?"; return; }
+    file_version "$_e"
+}
+
+md5_of() { [ -f "$1" ] && md5sum "$1" 2>/dev/null | cut -d' ' -f1 || echo "?"; }
+
+installed_version() {
+    if [ -f "$OTA_ROOT/version" ]; then
+        norm_ver "$(cat "$OTA_ROOT/version" 2>/dev/null)"
+    else
+        norm_ver "$(file_version "$APP")"
+    fi
+}
+
+# ---------------------------------------------------------------- 状态
+cmd_status() {
+    log "===== smartcar-ota status ====="
+    if [ -f "$APP" ]; then
+        _am=$(md5_of "$APP")
+        log "安装文件    : $APP"
+        log "  大小      : $(wc -c < "$APP") B"
+        log "  md5       : $_am"
+        log "  版本串    : $(file_version "$APP")"
+    else
+        log "安装文件    : **不存在** ($APP)"
+    fi
+    _rp=$(running_pid)
+    if [ -n "$_rp" ]; then
+        _re=$(running_exe)
+        log "运行进程    : pid=$_rp exe=$_re"
+        log "  进程版本  : $(running_version)"
+        if [ -n "$_re" ] && [ -f "$_re" ]; then
+            log "  进程md5   : $(md5_of "$_re")"
+            if [ "$_re" = "$APP" ]; then
+                log "  一致性    : 运行的就是安装位置的文件"
+            else
+                log "  一致性    : ⚠ 进程跑的不是 $APP"
+            fi
+        fi
+    else
+        log "运行进程    : **未运行**"
+    fi
+    log "记录版本    : $(installed_version)"
+    log "OTA 根目录  : $OTA_ROOT"
+    if [ -d "$SLOT_DIR" ]; then
+        log "可用 slot（回滚用）:"
+        slot_list | while IFS="$(printf '\t')" read -r _t _n _v; do
+            [ -n "$_n" ] || continue
+            log "  slot $_n  版本='$_v'  md5=$(cat "$SLOT_DIR/$_n/md5" 2>/dev/null)  备份于 $_t"
+        done
+    fi
+    log "空间        : $(df -h /userdata 2>/dev/null | tail -1)"
+}
+
+# ---------------------------------------------------------------- 拉 manifest
+# 成功时把 manifest 落到 $META，并把来源目录写到 stdout 之外用全局变量 SOURCE_DIR
+SOURCE_DIR=""
+fetch_manifest() {
+    if [ -n "$LOCAL_DIR" ]; then
+        [ -f "$LOCAL_DIR/manifest.json" ] || die "本地目录没有 manifest.json: $LOCAL_DIR"
+        cp -f "$LOCAL_DIR/manifest.json" "$META" || die "复制本地 manifest 失败"
+        SOURCE_DIR="$LOCAL_DIR"
+        log "manifest 来源 : 本地目录 $LOCAL_DIR"
+        return 0
+    fi
+    rm -f "$META"
+    log "manifest 来源 : $MANIFEST_URL"
+    _n=0
+    while [ $_n -lt $WGET_TRIES ]; do
+        _n=$((_n + 1))
+        if wget -q -T $WGET_TIMEOUT -O "$META" "$MANIFEST_URL" 2>>"$PERSIST_LOG"; then
+            [ -s "$META" ] && { log "manifest 已下载 ($(wc -c < "$META") B)"; return 0; }
+        fi
+        log "下载 manifest 失败（第 $_n 次），重试…"
+        sleep 2
+    done
+    die "无法下载 manifest（$MANIFEST_URL）。检查网络 / adb reverse 隧道。"
+}
+
+# 取 manifest 里的一项包信息到全局变量
+#   PKG_VERSION PKG_FILE PKG_SIZE PKG_MD5
+read_manifest_app() {
+    PKG_VERSION=$(json_str "$META" version)
+    PKG_FILE=$(json_str "$META" app_file)
+    PKG_SIZE=$(json_num "$META" app_size)
+    PKG_MD5=$(json_str "$META" app_md5)
+    [ -n "$PKG_VERSION" ] || die "manifest 解析失败：没有 version 字段"
+    [ -n "$PKG_FILE" ] || die "manifest 解析失败：没有 app_file 字段"
+    [ -n "$PKG_MD5" ] || die "manifest 解析失败：没有 app_md5 字段"
+}
+
+cmd_check() {
+    log "===== smartcar-ota check ====="
+    fetch_manifest
+    read_manifest_app
+    _cur=$(installed_version)
+    log "服务端版本  : $PKG_VERSION"
+    log "  包文件    : $PKG_FILE  ($PKG_SIZE B)"
+    log "  包 md5    : $PKG_MD5"
+    log "  说明      : $(json_str "$META" notes)"
+    log "  发布时间  : $(json_str "$META" released_at)"
+    log "本机版本    : $_cur"
+    if ver_lt "$_cur" "$PKG_VERSION"; then
+        log "结论        : **有新版本可升级** ($_cur -> $PKG_VERSION)"
+        echo "OTA_UPDATE_AVAILABLE"
+    elif [ "$_cur" = "$PKG_VERSION" ]; then
+        log "结论        : 已是最新 ($_cur)"
+        echo "OTA_UP_TO_DATE"
+    else
+        log "结论        : 本机版本($_cur) 比服务端($PKG_VERSION) 新，不降级"
+        echo "OTA_LOCAL_NEWER"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- 下载 + 校验
+# 全局：PKG_PATH
+download_pkg() {
+    _name="$1"; _want_md5="$2"; _want_size="$3"
+    rm -rf "$TMP_DIR"
+    mkdir -p "$TMP_DIR" || die "无法创建 $TMP_DIR"
+    PKG_PATH="$TMP_DIR/$_name"
+    if [ -n "$SOURCE_DIR" ]; then
+        [ -f "$SOURCE_DIR/$_name" ] || die "本地包不存在: $SOURCE_DIR/$_name"
+        cp -f "$SOURCE_DIR/$_name" "$PKG_PATH" || die "复制本地包失败"
+        log "包来源      : 本地 $SOURCE_DIR/$_name"
+    else
+        _url="${MANIFEST_URL%/*}/$_name"
+        log "开始下载    : $_url"
+        _n=0
+        while [ $_n -lt $WGET_TRIES ]; do
+            _n=$((_n + 1))
+            if wget -q -T $WGET_TIMEOUT -O "$PKG_PATH" "$_url" 2>>"$PERSIST_LOG"; then
+                break
+            fi
+            log "下载失败（第 $_n 次），重试…"
+            sleep 2
+        done
+        [ -s "$PKG_PATH" ] || die "包下载失败: $_url"
+    fi
+    # ---- 校验 1：md5（防传输损坏 / 防服务端文件被换）
+    _got_md5=$(md5_of "$PKG_PATH")
+    log "包已就绪    : $PKG_PATH"
+    log "  大小      : $(wc -c < "$PKG_PATH") B  (期望 ${_want_size:-?})"
+    log "  md5       : $_got_md5"
+    log "  期望 md5  : $_want_md5"
+    [ "$_got_md5" = "$_want_md5" ] || {
+        rm -f "$PKG_PATH"
+        die "md5 校验失败（拒绝安装）：期望 $_want_md5，实际 $_got_md5"
+    }
+    log "  ✔ md5 校验通过"
+    # ---- 校验 2：大小（md5 过了基本够，但大小不符说明服务端 manifest 与包不同步）
+    if [ -n "$_want_size" ] && [ "$_want_size" -gt 0 ] 2>/dev/null; then
+        _got_size=$(wc -c < "$PKG_PATH")
+        [ "$_got_size" = "$_want_size" ] || {
+            rm -f "$PKG_PATH"
+            die "大小校验失败：期望 $_want_size，实际 $_got_size"
+        }
+        log "  ✔ 大小校验通过"
+    fi
+    # ---- 校验 3：包本身能不能解开、里面有没有目标文件
+    _stage="$TMP_DIR/stage"
+    rm -rf "$_stage"; mkdir -p "$_stage"
+    tar -xzf "$PKG_PATH" -C "$_stage" 2>>"$PERSIST_LOG" || die "解包失败（不是合法 tar.gz）"
+    [ -f "$_stage/$APP_NAME" ] || die "包里没有 $APP_NAME"
+    STAGE_DIR="$_stage"
+    log "  ✔ 解包通过（含 $APP_NAME）"
+}
+
+# ---------------------------------------------------------------- slot 管理
+# slot 目录名用**递增序号**（0001/0002/…），不直接用版本号：
+#   本板当前在跑的那份应用是"加版本串之前"的构建，ELF 里根本没有版本串，
+#   如果拿版本号当目录名会得到一个叫 "?" 的目录，后面 latest_slot/回滚
+#   全都会变得很别扭。序号是永远可用的，版本另存在 slot 里的 version 文件。
+next_slot_name() {
+    _max=0
+    for _d in "$SLOT_DIR"/*; do
+        [ -d "$_d" ] || continue
+        _n=$(basename "$_d")
+        case "$_n" in
+            *[!0-9]*) continue ;;
+        esac
+        _n=$(printf '%s' "$_n" | sed 's/^0*//'); [ -z "$_n" ] && _n=0
+        [ "$_n" -gt "$_max" ] && _max=$_n
+    done
+    printf '%04d' $((_max + 1))
+}
+
+# 把当前安装的版本存成 slot（回滚用）
+snapshot_current() {
+    [ -f "$APP" ] || { log "当前没有安装文件，跳过 slot 备份"; return 0; }
+    _v=$(installed_version)
+    _name=$(next_slot_name)
+    _d="$SLOT_DIR/$_name"
+    mkdir -p "$_d" || die "无法创建 slot 目录 $_d"
+    cp -f "$APP" "$_d/$APP_NAME" || die "备份当前版本到 slot 失败"
+    md5sum "$_d/$APP_NAME" | cut -d' ' -f1 > "$_d/md5"
+    date '+%Y-%m-%d %H:%M:%S' > "$_d/installed_at"
+    printf '%s' "$_v" > "$_d/version"
+    log "已备份当前版本到 slot $_name (版本='$_v', md5=$(cat "$_d/md5"))"
+}
+
+# ---------------------------------------------------------------- 重启 + 自证
+restart_app() {
+    [ -x "$INITD" ] || die "$INITD 不存在或不可执行"
+    log "重启应用    : $INITD restart"
+    "$INITD" restart >>"$PERSIST_LOG" 2>&1
+    log "重启命令已返回，等待应用起来…"
+}
+
+# 等待进程起来，并且**跑的是 $1 这个文件、版本串是 $2**
+# 返回 0 = 通过，1 = 超时
+wait_running_ok() {
+    _want_exe="$1"; _want_ver="$2"
+    _i=0
+    while [ $_i -lt $BOOT_TRIES ]; do
+        sleep $BOOT_INTERVAL
+        _p=$(running_pid)
+        if [ -n "$_p" ]; then
+            _e=$(readlink "/proc/$_p/exe" 2>/dev/null)
+            _v=$(norm_ver "$(running_version)")
+            log "  [${_i}s] pid=$_p exe=$_e version=$_v"
+            if [ "$_e" = "$_want_exe" ] && [ "$_v" = "$_want_ver" ]; then
+                log "  ✔ 运行中的进程就是目标文件且版本串匹配"
+                return 0
+            fi
+        else
+            log "  [${_i}s] 进程尚未起来"
+        fi
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+cmd_verify() {
+    log "===== smartcar-ota verify ====="
+    _av=$(norm_ver "$(file_version "$APP")")
+    _rv=$(norm_ver "$(running_version)")
+    _am=$(md5_of "$APP")
+    _re=$(running_exe)
+    _rm="?"
+    [ -n "$_re" ] && [ -f "$_re" ] && _rm=$(md5_of "$_re")
+    log "磁盘文件版本: $_av   md5=$_am"
+    log "运行进程版本: $_rv   md5=$_rm   exe=$_re"
+    if [ -n "$_re" ] && [ "$_re" = "$APP" ] && [ "$_am" = "$_rm" ] && [ "$_av" = "$_rv" ] && [ "$_av" != "?" ]; then
+        log "结论        : ✔ 一致（运行中的就是安装的新版本）"
+        echo "OTA_VERIFY_OK"
+        return 0
+    fi
+    log "结论        : ✘ 不一致"
+    echo "OTA_VERIFY_FAIL"
+    return 1
+}
+
+# ---------------------------------------------------------------- 安装
+# $1 = 目标版本；假设包已下好且在 $STAGE_DIR
+install_stage() {
+    _v="$1"
+    _src="$STAGE_DIR/$APP_NAME"
+    _new="$APP_DIR/.$APP_NAME.new"
+    [ -f "$_src" ] || die "暂存目录里没有 $APP_NAME"
+    # 1) 先落到**同分区的临时文件**（不能落 /tmp：tmpfs 跨分区 rename 不原子）
+    rm -f "$_new"
+    cp -f "$_src" "$_new" || die "写临时文件失败 $_new"
+    chmod 755 "$_new"
+    # 2) 复核临时文件的 md5（cp 也可能出问题）
+    _sm=$(md5_of "$_src"); _nm=$(md5_of "$_new")
+    [ "$_sm" = "$_nm" ] || { rm -f "$_new"; die "临时文件 md5 不一致（$_sm vs $_nm）"; }
+    log "临时文件已就绪: $_new  md5=$_nm"
+    # 3) 原子替换
+    mv -f "$_new" "$APP" || die "原子替换失败"
+    sync
+    log "原子替换完成: $APP  md5=$(md5_of "$APP")"
+    # 4) 记录版本
+    echo "$_v" > "$OTA_ROOT/version"
+    # 5) 兜底自检：替换后的文件版本串必须是目标版本
+    _inst=$(norm_ver "$(file_version "$APP")")
+    [ "$_inst" = "$_v" ] || {
+        log "!! 装机后版本串不符（期望 $_v，实际 $_inst）"
+        return 1
+    }
+    log "装机后版本串: $_inst ✔"
+    return 0
+}
+
+# 列出 slot：时间戳 + 目录名 + 版本。按 installed_at 排序取最后一个 = 最近备份。
+# （不按目录名字典序：slot 名虽然是 0001/0002，但一旦有人手工改了名字就不成立。）
+slot_list() {
+    for _d in "$SLOT_DIR"/*; do
+        [ -d "$_d" ] || continue
+        _t=$(cat "$_d/installed_at" 2>/dev/null)
+        _v=$(cat "$_d/version" 2>/dev/null)
+        printf '%s\t%s\t%s\n' "${_t:-0000-00-00 00:00:00}" "$(basename "$_d")" "$_v"
+    done
+}
+
+# 取最近一次备份出来的 slot 名（= 回滚目标）
+latest_slot() {
+    slot_list | sort | tail -1 | cut -f2
+}
+
+# 回滚到某个 slot（默认最近的那个）
+do_rollback() {
+    _want="$1"
+    if [ -z "$_want" ]; then
+        _want=$(latest_slot)
+        [ -n "$_want" ] || { log "没有可用 slot，无法回滚"; return 1; }
+    fi
+    _d="$SLOT_DIR/$_want"
+    [ -f "$_d/$APP_NAME" ] || { log "slot 不存在: $_d"; return 1; }
+    log "回滚到      : $_want (md5=$(cat "$_d/md5" 2>/dev/null))"
+    cp -f "$_d/$APP_NAME" "$APP_DIR/.$APP_NAME.new" || { log "回滚拷贝失败"; return 1; }
+    chmod 755 "$APP_DIR/.$APP_NAME.new"
+    mv -f "$APP_DIR/.$APP_NAME.new" "$APP" || { log "回滚替换失败"; return 1; }
+    sync
+    _v=$(cat "$_d/version" 2>/dev/null)
+    case "$_v" in ""|"?"|"[?]") _v=$(norm_ver "$(file_version "$APP")") ;; esac
+    echo "$_v" > "$OTA_ROOT/version"
+    log "已回滚，版本记录: $_v  md5=$(md5_of "$APP")"
+    return 0
+}
+
+cmd_update() {
+    _force=0
+    [ "${1:-}" = "--force" ] && _force=1
+    log "===== smartcar-ota update (force=$_force) ====="
+    fetch_manifest
+    read_manifest_app
+    _cur=$(installed_version)
+
+    # 首次升级的特殊情况：板上装的还是"加版本串之前"的老构建，ELF 里没有版本串，
+    # 于是 installed_version 是空的 —— 这时**不能**直接和 str 比大小。
+    # 这属于"服务端说这是当前最新，就把本地认成这个版本"，然后照常升级。
+    # 是覆盖安装，不是降级，也不会被误判成"本地更新"。
+    if [ -z "$_cur" ] || [ "$_cur" = "?" ]; then
+        log "本机没有版本记录（老构建，ELF 里无版本串）"
+        log "按服务端当前版本 $PKG_VERSION 作为本地基线，继续执行覆盖升级"
+        _cur="$PKG_VERSION"
+    fi
+
+    if [ $_force -eq 0 ]; then
+        if ! ver_lt "$_cur" "$PKG_VERSION"; then
+            if [ "$_cur" = "$PKG_VERSION" ]; then
+                log "已是最新版本 $PKG_VERSION，无需升级"
+                echo "OTA_UP_TO_DATE"
+                return 0
+            fi
+            log "本机版本 $_cur 比服务端 $PKG_VERSION 新，不降级（要强制请用 update --force）"
+            echo "OTA_LOCAL_NEWER"
+            return 0
+        fi
+    fi
+    log "升级路径    : $_cur -> $PKG_VERSION"
+
+    # ---- 1) 下载 + 三重校验（md5 / 大小 / 能否解包）
+    download_pkg "$PKG_FILE" "$PKG_MD5" "$PKG_SIZE"
+
+    # ---- 2) 校验通过之后再备份当前版本。
+    #   顺序很重要：备份放在校验**之后**，是因为"md5 不匹配"这类失败
+    #   本来就不该动系统 —— 如果先备份，每次被拒绝的下载都会在
+    #   /userdata/ota/slots 下留一份 2.4MB 的重复槽位（实测演练里
+    #   9 个 slot 有 3 个是完全相同的 1.3.4），既浪费本来就不宽裕的
+    #   /userdata，也会让"回滚到上一个版本"的目标变得含糊。
+    #   而"原子替换"真正开始写盘是在 install_stage 里，所以这个位置
+    #   依然满足"任何写操作之前必须先有回滚材料"。
+    snapshot_current
+    _prev=$(installed_version)
+
+    # ---- 3) 原子安装
+    if ! install_stage "$PKG_VERSION"; then
+        log "!! 安装阶段失败，尝试回滚"
+        do_rollback "$_prev" && restart_app
+        echo "OTA_INSTALL_FAILED_ROLLED_BACK"
+        return 1
+    fi
+
+    # ---- 4) 重启 + 运行自证
+    restart_app
+    if wait_running_ok "$APP" "$PKG_VERSION"; then
+        log "✔ 升级成功：$PKG_VERSION 已在运行"
+        cmd_status
+        echo "OTA_UPDATE_OK version=$PKG_VERSION"
+        return 0
+    fi
+
+    # ---- 5) 起不来 / 跑的不是新的 -> 自动回滚
+    log "!! 新版本未能在限定时间内正常运行，自动回滚到 $_prev"
+    if do_rollback "$_prev"; then
+        restart_app
+        if wait_running_ok "$APP" "$_prev"; then
+            log "✔ 回滚成功，当前运行 $_prev"
+            cmd_status
+            echo "OTA_UPDATE_FAILED_ROLLED_BACK version=$_prev"
+            return 1
+        fi
+        log "!! 回滚后应用仍未起来，需要人工介入"
+        cmd_status
+        echo "OTA_ROLLBACK_ALSO_FAILED"
+        return 2
+    fi
+    log "!! 回滚动作本身失败"
+    echo "OTA_ROLLBACK_FAILED"
+    return 2
+}
+
+cmd_rollback() {
+    log "===== smartcar-ota rollback ${1:-<上一个>} ====="
+    _before=$(installed_version)
+    do_rollback "${1:-}" || die "回滚失败"
+    restart_app
+    _v=$(installed_version)
+    if wait_running_ok "$APP" "$_v"; then
+        log "✔ 回滚完成并已运行：$_before -> $_v"
+        cmd_status
+        echo "OTA_ROLLBACK_OK version=$_v"
+        return 0
+    fi
+    log "!! 回滚后应用未起来"
+    echo "OTA_ROLLBACK_RUNTIME_FAILED"
+    return 1
+}
+
+# ---------------------------------------------------------------- 固件层 OTA
+# 固件层比应用层危险得多：写坏了可能要拆机/短路进 Loader 才能救。
+# 因此这里的设计是：
+#   · firmware check  只读（不下载、不备份）
+#   · firmware dryrun 做**除擦写以外的全部动作**（下载、md5 校验、
+#                     nanddump 备份、回读基线），并打印
+#                     "将要写的分区 + 镜像 md5 + 回滚文件路径"
+#   · firmware flash  真写，必须显式 --yes，且备份失败就拒绝继续
+cmd_firmware() {
+    _act="${1:-check}"
+    _yes=0
+    [ "${2:-}" = "--yes" ] && _yes=1
+    [ "${2:-}" = "--i-have-a-backup" ] && _yes=1
+
+    case "$_act" in
+        check|dryrun|flash) ;;
+        *) log "ERROR: 未知固件动作 '$_act'（可选 check|dryrun|flash）"; return 1 ;;
+    esac
+
+    fetch_manifest
+    _fw_count=$(grep -c '"partition"' "$META" 2>/dev/null)
+    [ "$_fw_count" -gt 0 ] 2>/dev/null || { log "manifest 里没有固件条目"; echo "OTA_NO_FIRMWARE"; return 0; }
+
+    log "===== smartcar-ota firmware $_act ====="
+    log "分区布局（/proc/mtd）:"
+    while IFS= read -r _l; do log_raw "  $_l"; done < /proc/mtd
+    log "manifest 中固件条目数: $_fw_count"
+
+    # 从 manifest 里把 firmware 数组拆成"一行一个对象"。
+    # ⚠ 不能按行首缩进去切：ota_publish.py 用 json.dump(indent=2) 输出的是
+    #   **多行美化 JSON**（`{`、各字段、`}` 各占一行），实测按前缀取对象会
+    #   一个都取不到（"条目 1 解析失败"）。这里改成按花括号配对累积，
+    #   紧凑格式和美化格式都能吃。
+    mkdir -p "$TMP_DIR"
+    _fwl="$TMP_DIR/.fwlist"
+    awk '
+      /"firmware"[[:space:]]*:[[:space:]]*\[/ { inarr=1; next }
+      inarr && /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/ { inarr=0; next }
+      !inarr { next }
+      {
+        line=$0
+        if (buf != "") buf = buf " " line; else buf = line
+        if (line ~ /}[[:space:]]*,?[[:space:]]*$/) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", buf)
+          sub(/,[[:space:]]*$/, "", buf)
+          if (buf ~ /^\{/) print buf
+          buf = ""
+        }
+      }
+    ' "$META" > "$_fwl"
+    log "  固件条目原文（每行一个对象）:"
+    while IFS= read -r _o; do log_raw "    $_o"; done < "$_fwl"
+
+    _i=0
+    while IFS= read -r _obj; do
+        [ -n "$_obj" ] || continue
+        _i=$((_i + 1))
+        _nm=$(printf '%s' "$_obj"  | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        _part=$(printf '%s' "$_obj" | sed -n 's/.*"partition"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        _img=$(printf '%s' "$_obj"  | sed -n 's/.*"image"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        _sz=$(printf '%s' "$_obj"   | sed -n 's/.*"size"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+        _md5=$(printf '%s' "$_obj"  | sed -n 's/.*"md5"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        [ -n "$_part" ] || { log "条目 $_i 解析失败，跳过"; continue; }
+        _mtdidx=$(printf '%s' "$_part" | sed 's/^mtd//')
+        _dev="/dev/mtd$_mtdidx"
+        [ -e "$_dev" ] || _dev="/dev/$_part"
+        log "-----------------------------------------------"
+        log "固件条目 $_i : $_nm"
+        log "  镜像      : $_img  ($_sz B)"
+        log "  期望 md5  : $_md5"
+        log "  目标分区  : $_dev   [$(sed -n "/$_mtdidx:/p" /proc/mtd | cut -d'"' -f2)]"
+        [ -e "$_dev" ] || { log "  !! 设备节点不存在，跳过"; continue; }
+
+        # --- 下载 + 校验（这一步 check/dryrun/flash 都一样要过）
+        if [ -n "$LOCAL_DIR" ] && [ -f "$LOCAL_DIR/$_img" ]; then
+            _lp="$TMP_DIR/fw_$_img"
+            mkdir -p "$TMP_DIR"
+            cp -f "$LOCAL_DIR/$_img" "$_lp"
+        else
+            _lp="$TMP_DIR/fw_$_img"
+            mkdir -p "$TMP_DIR"
+            _url="${MANIFEST_URL%/*}/$_img"
+            log "  下载      : $_url"
+            wget -q -T $WGET_TIMEOUT -O "$_lp" "$_url" 2>>"$PERSIST_LOG" || { log "  !! 下载失败"; continue; }
+        fi
+        _got=$(md5_of "$_lp")
+        log "  实际 md5  : $_got"
+        if [ "$_got" != "$_md5" ]; then
+            log "  !! **md5 不匹配，拒绝写入该分区**"
+            continue
+        fi
+        log "  ✔ md5 校验通过"
+
+        # --- 备份现有分区内容（回滚材料），并记录回读基线
+        # 回滚文件用**整分区 dump**（不是只 dump 镜像长度），这样回滚时
+        # `nandwrite -p <dev> <bak>` 能把分区恢复成写之前的样子。
+        mkdir -p "$FWBK_DIR"
+        _bk="$FWBK_DIR/${_part}_backup_$(date +%Y%m%d_%H%M%S).bin"
+        log "  备份现有分区 -> $_bk"
+        nanddump --noecc --omitoob "$_dev" > "$_bk" 2>>"$PERSIST_LOG"
+        if [ ! -s "$_bk" ]; then
+            log "  !! **备份失败，拒绝继续**"
+            continue
+        fi
+        log "  备份大小  : $(wc -c < "$_bk") B"
+        log "  备份 md5  : $(md5_of "$_bk")"
+        log "  -- 写入前该分区前 16 字节 --"
+        # 板上没有 hexdump（buildroot 精简掉了），只有 busybox od
+        run_pipe "     " od -A x -t x1z -N 16 "$_dev"
+        log "  -- 镜像前 16 字节 --"
+        run_pipe "     " od -A x -t x1z -N 16 "$_lp"
+
+        if [ "$_act" != "flash" ]; then
+            log "  [$_act] 只做准备，**未擦写**。真写命令："
+            log "    flash_erase $_dev 0 0 && nandwrite -p $_dev $_lp"
+            log "  回滚：nandwrite -p $_dev $_bk"
+            continue
+        fi
+
+        # --- 真写
+        if [ $_yes -ne 1 ]; then
+            log "  !! flash 需要二次确认：smartcar-ota firmware flash --yes"
+            continue
+        fi
+        log "  >>> 即将擦写 $_dev"
+        log "  >>> 镜像   $_lp  md5=$_md5"
+        log "  >>> 回滚   nandwrite -p $_dev $_bk"
+        if ! flash_erase "$_dev" 0 0 >>"$PERSIST_LOG" 2>&1; then
+            log "  !! flash_erase 失败，未写入任何数据"
+            continue
+        fi
+        if ! nandwrite -p "$_dev" "$_lp" >>"$PERSIST_LOG" 2>&1; then
+            log "  !! nandwrite 失败！分区现在可能不完整，请用 $_bk 回滚："
+            log "     nandwrite -p $_dev $_bk"
+            continue
+        fi
+        sync
+        _rb=$(nanddump --noecc --omitoob -l "$_sz" "$_dev" 2>/dev/null | md5sum | cut -d' ' -f1)
+        log "  回读 md5  : $_rb  (期望 $_md5)"
+        if [ "$_rb" = "$_md5" ]; then
+            log "  ✔ 写入并回读校验通过"
+        else
+            log "  !! **回读校验失败，请立刻用 $_bk 回滚**"
+        fi
+        log "  ⚠ 需要**断电冷启动**才生效（M0/AMP 固件尤其如此，adb reboot 不行）"
+    done < "$_fwl"
+    echo "OTA_FIRMWARE_DONE act=$_act"
+}
+
+# ---------------------------------------------------------------- 入口
+LOCAL_DIR=""
+CMD="${1:-status}"
+shift 2>/dev/null || true
+# 注意：`firmware` 的子命令不要再 shift 一次 ——
+# 上面那行已经把 "firmware" 移掉了，$1 就是子命令本身。
+# 早期版本在这里又 shift 了一遍，导致 `firmware dryrun` 被降级成 `check`
+# （日志标题也一直是 act=check），预演和只读检查的语义就混了。
+
+case "$CMD" in
+    status)   cmd_status ;;
+    check)    cmd_check ;;
+    update)   cmd_update "${1:-}" ;;
+    rollback) cmd_rollback "${1:-}" ;;
+    verify)   cmd_verify ;;
+    firmware) cmd_firmware "${1:-check}" "${2:-}" ;;
+    local)
+        LOCAL_DIR="${1:-}"
+        [ -n "$LOCAL_DIR" ] || die "用法: smartcar-ota local <目录>"
+        [ -d "$LOCAL_DIR" ] || die "目录不存在: $LOCAL_DIR"
+        cmd_update "--force" ;;
+    *)
+        cat <<EOF
+smartcar-ota —— Smart_car 车机 OTA 客户端
+
+  status                当前安装/运行版本与 slot 列表
+  check                 拉服务端 manifest 比对版本（不安装）
+  update [--force]      升级（失败自动回滚）
+  local <目录>          离线升级（读本地 manifest.json + 包）
+  rollback [版本]       回滚到上一个/指定 slot
+  verify                校验"运行中的进程 == 安装的文件 == 版本串"
+  firmware check|dryrun|flash [--yes]   固件层(mtd4/mtd6) OTA
+
+环境变量覆盖：SMARTCAR_OTA_URL / SMARTCAR_APP_DIR / SMARTCAR_OTA_ROOT
+日志：$LOG 与 $PERSIST_LOG
+EOF
+        exit 1 ;;
+esac
+exit 0

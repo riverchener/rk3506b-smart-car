@@ -1,0 +1,33 @@
+mainmenu "RT-Thread Configuration"
+
+config BSP_DIR
+    string
+    option env="BSP_ROOT"
+    default "."
+
+config RTT_DIR
+    string
+    option env="RTT_ROOT"
+    default "../../.."
+
+config PKGS_DIR
+    string
+    option env="PKGS_ROOT"
+    default "packages"
+
+# RK3506 "BUS M0" = the Cortex-M0 AMP co-processor (the A7 cluster is a
+# separate, much larger target: rtos/bsp/rockchip/rk3506-32).
+config BSP_RK3506_MCU
+    bool
+    default y
+    select ARCH_ARM_CORTEX_M0
+
+source "$RTT_DIR/Kconfig"
+
+menu "RT-Thread board config"
+
+config RT_BOARD_NAME
+    string "the board name of you use"
+    default "evb"
+
+endmenu

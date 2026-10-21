@@ -1,0 +1,195 @@
+#!/bin/sh
+#
+# wifi-ctl —— WiFi 开关控制（供车载应用左下角「连接 WiFi」按钮调用）
+#
+# 用法：
+#   wifi-ctl enable       开启 WiFi（关联已保存的网络 + DHCP）；连不上也算"已开启"
+#   wifi-ctl disable      关闭 WiFi（停 wpa_supplicant、释放 IP、网卡 down）
+#   wifi-ctl toggle       已开启则关、未开启则开
+#   wifi-ctl status       打印状态：
+#                           "connected <IP>"  已连接        (exit 0)
+#                           "enabled"         WiFi 开着没连上 (exit 1)
+#                           "disabled"        WiFi 关着       (exit 2)
+#
+# 设计要点：**"开关状态"与"是否连上"分开**。
+# WiFi 打开后，即使对方热点关了/信号没了，开关也保持"开"，
+# 界面显示黄色"未发现wifi"，而不是自己弹回"关"。
+
+CONF=/etc/wpa_supplicant-smartcar.conf
+IFACE=wlan0
+# 应用里的 NetworkWatcher 靠轮询这个文件判断"网络连上/断开"，
+# 格式：第1行 OK|DOWN|FAIL / 第2行 SSID 或原因 / 第3行 IP（OK 时）。
+# 手动连 WiFi 也必须写它，否则应用收不到 networkConnected（详见 do_enable 注释）。
+STATUS=/var/run/smartcar-net.status
+[ -f /etc/smartcar.conf ] && . /etc/smartcar.conf
+[ -n "$SMARTCAR_WIFI_IFACE" ] && IFACE="$SMARTCAR_WIFI_IFACE"
+
+log() { echo "$(date '+%m-%d %H:%M:%S') wifi-ctl: $*"; }
+
+iface_exists() { [ -e "/sys/class/net/$IFACE" ]; }
+
+has_ip() {
+    iface_exists || return 1
+    ip -4 addr show "$IFACE" 2>/dev/null | grep -q 'inet '
+}
+
+is_associated() {
+    iface_exists || return 1
+    [ "$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p')" = "COMPLETED" ]
+}
+
+# WiFi 是否处于"开启"状态 = wpa_supplicant 正在管这张网卡
+is_enabled() {
+    ps 2>/dev/null | grep -v grep | grep -q "wpa_supplicant.*$IFACE"
+}
+
+wait_iface() {
+    iface_exists && return 0
+    log "网卡 $IFACE 还不存在，等待枚举（最多 60 秒）..."
+    w=0
+    while [ $w -lt 300 ]; do
+        iface_exists && break
+        w=$((w + 1))
+        usleep 200000 2>/dev/null || sleep 0.2
+    done
+    if iface_exists; then
+        log "网卡已出现（等待约 $((w / 5)) 秒）"
+        return 0
+    fi
+    return 1
+}
+
+do_enable() {
+    if ! wait_iface; then
+        log "失败：等不到网卡 $IFACE"
+        echo "FAIL:WiFi 网卡未就绪"
+        return 1
+    fi
+
+    # connman 让开，别抢网卡
+    connmanctl disable wifi >/dev/null 2>&1
+    rfkill unblock all >/dev/null 2>&1
+
+    if [ ! -f "$CONF" ]; then
+        log "失败：找不到 $CONF"
+        echo "FAIL:没有保存的 WiFi 配置"
+        return 1
+    fi
+
+    if has_ip; then
+        log "已经连接（有 IP），无需重连"
+        echo "OK:已连接"
+        return 0
+    fi
+
+    log "开启 WiFi，尝试连接已保存的网络..."
+    killall udhcpc >/dev/null 2>&1
+    wpa_cli -i "$IFACE" terminate >/dev/null 2>&1
+    killall wpa_supplicant >/dev/null 2>&1
+    sleep 1
+
+    ip link set "$IFACE" down >/dev/null 2>&1
+    ip link set "$IFACE" up >/dev/null 2>&1
+    sleep 1
+
+    # 关键：wpa_supplicant 起来就算"已开启"，之后连不上也保持开启
+    wpa_supplicant -B -i "$IFACE" -c "$CONF" -Dnl80211 >/dev/null 2>&1
+    echo "OK:已开启"
+
+    i=0
+    while [ $i -lt 40 ]; do
+        is_associated && break
+        i=$((i + 1))
+        sleep 1
+    done
+
+    if ! is_associated; then
+        log "WiFi 已开启，但暂时连不上（热点关了？信号弱？）"
+        echo "NOCONN:未发现可连接的 WiFi"
+        return 0        # 仍返回成功 —— 开关确实是开着的
+    fi
+
+    log "已关联（等待 ${i}s），开始获取 IP..."
+    udhcpc -i "$IFACE" -n -q -t 8 -T 3 >/dev/null 2>&1
+
+    # 关掉 WiFi 省电：RTL8733BU 是 WiFi+BT 二合一，共用一根 2.4G 天线，
+    # 省电会让射频周期性休眠、明显影响蓝牙扫描/配对共存。
+    iw dev "$IFACE" set power_save off 2>/dev/null \
+        && log "已关闭 $IFACE 省电（改善 WiFi/蓝牙共存）"
+
+    if has_ip; then
+        DNS1=$(sed -n 's/^nameserver \([0-9.]*\).*/\1/p' /tmp/resolv.conf.udhcpc 2>/dev/null | grep -v 127.0.0.1 | head -1)
+        [ -n "$DNS1" ] || DNS1=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+        {
+            echo "# smartcar: DHCP + 公共 DNS"
+            [ -n "$DNS1" ] && echo "nameserver $DNS1"
+            echo "nameserver 223.5.5.5"
+            echo "nameserver 114.114.114.114"
+        } > /etc/resolv.conf
+        IP=$(ip -4 addr show "$IFACE" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+        log "连接成功，IP=$IP"
+
+        # ------------------------------------------------------------------
+        # 写网络状态文件 —— **很重要，别漏**。
+        #
+        # NetworkWatcher（应用里）是**轮询 /var/run/smartcar-net.status** 来判断
+        # "网络连上/断开"的，而以前只有开机自动连的 S47wifi 会写这个文件。
+        # 用户**在界面里手动连 WiFi** 时走的是本脚本，不写文件 -> 应用永远
+        # 收不到 networkConnected 信号：
+        #   · 左上角网络状态文字/弹窗不更新
+        #   · 连上热点后天气页不会自动刷新（用户看到"已经连上热点还是昨天的天气"）
+        # 所以这里补上，格式和 S47wifi 保持一致：
+        #   第1行 OK / 第2行 SSID（UTF-8）/ 第3行 IP
+        # ------------------------------------------------------------------
+        SSID_RAW=$(wpa_cli -i "$IFACE" status 2>/dev/null | grep '^ssid=' | cut -d= -f2-)
+        [ -n "$SSID_RAW" ] || SSID_RAW="WiFi"
+        printf 'OK\n%s\n%s\n' "$SSID_RAW" "$IP" > "$STATUS.tmp" 2>/dev/null \
+            && mv "$STATUS.tmp" "$STATUS" \
+            && log "已写网络状态文件 $STATUS（SSID=$SSID_RAW IP=$IP）"
+
+        echo "OK:已连接 $IP"
+    else
+        log "已关联但没拿到 IP（DHCP 失败）"
+        printf 'FAIL\n%s\n' "已关联但未获取到 IP" > "$STATUS.tmp" 2>/dev/null && mv "$STATUS.tmp" "$STATUS"
+        echo "NOCONN:已关联但未获取到 IP"
+    fi
+    return 0
+}
+
+do_disable() {
+    log "关闭 WiFi..."
+    killall udhcpc >/dev/null 2>&1
+    if iface_exists; then
+        wpa_cli -i "$IFACE" disconnect >/dev/null 2>&1
+        wpa_cli -i "$IFACE" terminate >/dev/null 2>&1
+        ip addr flush dev "$IFACE" >/dev/null 2>&1
+        ip link set "$IFACE" down >/dev/null 2>&1
+    fi
+    killall wpa_supplicant >/dev/null 2>&1
+    rm -f /var/run/smartcar-net.status
+    log "已关闭"
+    echo "OK:已关闭"
+    return 0
+}
+
+case "$1" in
+    enable|connect)     do_enable ;;
+    disable|disconnect) do_disable ;;
+    toggle)
+        if has_ip || is_enabled; then do_disable; else do_enable; fi
+        ;;
+    status)
+        if has_ip; then
+            IP=$(ip -4 addr show "$IFACE" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+            echo "connected $IP"; exit 0
+        elif is_enabled; then
+            echo "enabled"; exit 1
+        else
+            echo "disabled"; exit 2
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {enable|disable|toggle|status}"
+        exit 3
+        ;;
+esac

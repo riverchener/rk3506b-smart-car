@@ -1,0 +1,21 @@
+# Board support for the RK3506 BUS-M0 BSP.
+#
+# The board name may come from rtconfig.h (RT_BOARD_NAME, set by Kconfig); it
+# defaults to "evb", which is the only board directory this BSP ships.
+
+import os
+Import('rtconfig')
+from building import *
+
+cwd = GetCurrentDir()
+
+BOARD_NAME = 'evb'
+try:
+    BOARD_NAME = rtconfig.RT_BOARD_NAME
+except AttributeError:
+    pass
+
+objs = SConscript(os.path.join(cwd, BOARD_NAME, 'SConscript'),
+                  variant_dir='board/' + BOARD_NAME, duplicate=0)
+
+Return('objs')

@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# S46bluetooth-audio —— 开机把蓝牙做成一个"随时可连的音箱"
+#
+# 为什么要在开机脚本里自己设置适配器（不只靠应用）：
+#   应用那套要点开蓝牙页才生效，而且实测界面响应慢
+#   （weston 日志报 event processing lagging behind 100~268ms），用户常按不动。
+#   "手机连车机放歌"这件事**应该开机就绪**，不依赖任何界面操作。
+#
+# 做三件事：
+#   1) 等 HCI 就绪并上电
+#   2) 设置名称 / 可配对 / 可发现（手机才能搜到 "Smart_car" 并连上）
+#   3) 拉起 bluealsa(A2DP Sink) + bluealsa-aplay（把收到的音频播到车机喇叭）
+#
+# 实际工作交给 /userdata/smart_car/bt-boot-setup（独立脚本，避免本文件里的嵌套引号地狱）
+#
+# 关掉： /etc/init.d/S46bluetooth-audio stop
+# 日志： tail -f /var/log/smartcar-bt.log
+
+DAEMON="bluetooth-audio"
+LOG=/var/log/smartcar-bt.log
+SETUP=/userdata/smart_car/bt-boot-setup
+
+start() {
+    printf 'Starting %s: ' "$DAEMON"
+
+    if [ ! -x "$SETUP" ]; then
+        echo "FAIL ($SETUP 不存在)"
+        echo "$(date '+%m-%d %H:%M:%S') S46: $SETUP 不存在，跳过" >> "$LOG"
+        return 0
+    fi
+
+    # 后台跑，别拖慢开机（USB 蓝牙枚举可能要几秒）
+    setsid "$SETUP" </dev/null >/dev/null 2>&1 &
+
+    echo "OK"
+    return 0
+}
+
+stop() {
+    printf 'Stopping %s: ' "$DAEMON"
+    [ -x /userdata/smart_car/bt-ctl ] && /userdata/smart_car/bt-ctl audio-off >/dev/null 2>&1
+    echo "OK"
+    return 0
+}
+
+status() {
+    [ -x /userdata/smart_car/bt-ctl ] && /userdata/smart_car/bt-ctl audio-status
+}
+
+case "$1" in
+    start)  start ;;
+    stop)   stop ;;
+    restart|reload) stop; sleep 1; start ;;
+    status) status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0

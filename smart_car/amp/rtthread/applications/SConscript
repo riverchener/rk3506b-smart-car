@@ -1,0 +1,43 @@
+# Application group for the RK3506 BUS-M0 RT-Thread BSP.
+#
+# Contains the M0 service itself, the RT-Thread environment/platform port for
+# rpmsg-lite, and the rpmsg-lite core taken straight from the shared
+# hal/middleware tree (the bare-metal firmware uses the same sources).
+#
+# Deliberately NOT compiled from the middleware:
+#   rpmsg_lite/porting/environment/rpmsg_env_bm.c  -> rpmsg_env_rtthread.c here
+#   rpmsg_lite/porting/platform/RK3506/rpmsg_platform.c -> rpmsg_platform_rt.c
+#   test/rpmsg_perf.c                              -> benchmark, not needed
+#   rpmsg_lite/rpmsg_queue.c                       -> queue API unused here
+
+import os
+Import('RTT_ROOT')
+Import('rtconfig')
+from building import *
+
+bsp = str(Dir('#'))
+cwd = GetCurrentDir()
+hal = os.path.normpath(os.path.join(bsp, '..', 'common', 'hal'))
+rpl = os.path.join(hal, 'middleware', 'rpmsg-lite', 'lib')
+
+src = sorted(Glob('*.c'), key=lambda n: str(n))
+
+src += [rpl + '/common/llist.c',
+        rpl + '/virtio/virtqueue.c',
+        rpl + '/rpmsg_lite/rpmsg_lite.c',
+        rpl + '/rpmsg_lite/rpmsg_ns.c']
+
+CPPPATH = [cwd,
+           bsp,                                     # hal_conf.h
+           rpl + '/include',
+           rpl + '/include/environment/bm',         # rpmsg_env_specific.h
+           rpl + '/include/platform/RK3506',        # rpmsg_config.h / rpmsg_platform.h
+           hal + '/lib/hal/inc',
+           hal + '/lib/bsp/RK3506',
+           hal + '/lib/CMSIS/Device',
+           hal + '/lib/CMSIS/Device/RK3506/Include',
+           RTT_ROOT + '/include']
+
+group = DefineGroup('Applications', src, depend=[''], CPPPATH=CPPPATH)
+
+Return('group')

@@ -1,0 +1,68 @@
+# RT-Thread SConscript for the RK3506 "BUS M0" BSP.
+#
+# Three groups only:
+#   HAL            - the vendor HAL (hal/lib/...), pulled in from the shared
+#                    hal/ tree that the bare-metal M0 project uses too
+#   board + apps   - everything under this BSP
+# There is no RT-Thread component directory in this build on purpose; see
+# rtconfig.h for the list of things that are switched off.
+
+import os
+Import('RTT_ROOT')
+from building import *
+
+PROJECT = 'RK3506'
+Export('PROJECT')
+
+cwd = str(Dir('#'))                 # absolute path of the BSP directory
+objs = []
+
+
+def glob_sorted(*patterns):
+    """Glob(), but in a deterministic order.
+
+    SCons returns glob matches in directory order, and this build creates and
+    deletes .o files inside the shared hal/ tree on every run (see
+    build_m0_rtt.sh), which shuffles that order.  That is enough to change the
+    link order of the HAL objects and therefore the address of every symbol and
+    the md5 of the image.  Sorting the source lists makes the build
+    byte-reproducible.
+    """
+    out = []
+    for p in patterns:
+        out += Glob(p)
+    return sorted(out, key=lambda n: str(n))
+
+# ---------------------------------------------------------------------------
+# Vendor HAL.  Written out by hand instead of reusing
+# bsp/rockchip/common/HalSConscript because that script does not add
+# RTT_ROOT/include to the include path, and hal_debug.h needs rtthread.h when
+# HAL_DBG_USING_RTT_SERIAL is set (see hal_conf.h).
+# ---------------------------------------------------------------------------
+hal_lib = os.path.normpath(os.path.join(cwd, '..', 'common', 'hal', 'lib'))
+
+hal_src = glob_sorted(hal_lib + '/CMSIS/Device/RK3506/Source/Templates/*.c',
+                      hal_lib + '/CMSIS/Device/RK3506/Source/Templates/GCC/*.S',
+                      hal_lib + '/hal/src/*.c',
+                      hal_lib + '/hal/src/*/*.c',
+                      hal_lib + '/bsp/RK3506/*.c')
+
+hal_path = [hal_lib + '/hal/inc',
+            hal_lib + '/bsp/RK3506',
+            hal_lib + '/CMSIS/Device',
+            hal_lib + '/CMSIS/Device/RK3506/Include',
+            hal_lib + '/CMSIS/Core/Include',
+            RTT_ROOT + '/include']
+
+objs += DefineGroup('HAL', hal_src, depend=[''], CPPPATH=hal_path,
+                    CPPDEFINES=['HAS_ROCKCHIP_HAL'])
+
+# ---------------------------------------------------------------------------
+# Board + application
+# ---------------------------------------------------------------------------
+for d in ['board', 'drivers', 'applications']:
+    path = os.path.join(cwd, d)
+    if os.path.isfile(os.path.join(path, 'SConscript')):
+        objs = objs + SConscript(os.path.join(path, 'SConscript'))
+
+Return('objs')

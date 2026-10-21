@@ -1,0 +1,283 @@
+/* ============================================================================
+   style.css —— RK3506B 车机 CAN 调试台（纯本地，深色，无外网资源）
+   ========================================================================= */
+
+:root {
+  --bg:        #12151c;
+  --bg-panel:  #1a1f29;
+  --bg-panel2: #212734;
+  --bg-input:  #0e1219;
+  --line:      #2c3444;
+  --line-soft: #232a37;
+  --fg:        #dfe5f0;
+  --fg-dim:    #8b95a8;
+  --fg-dim2:   #626d80;
+  --accent:    #4da3ff;
+  --accent2:   #2f7fd1;
+  --rx:        #7fd6a0;
+  --tx:        #ffc46b;
+  --warn:      #ff9c5b;
+  --err:       #ff6b6b;
+  --ok:        #55d68b;
+  --mono: "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
+  --ui: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+        system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--ui);
+  font-size: 14px;
+}
+
+body { display: flex; flex-direction: column; overflow: hidden; }
+
+/* ---------------------------------------------------------------- 顶栏 */
+header {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  padding: 8px 14px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: .5px;
+  white-space: nowrap;
+}
+.brand small { color: var(--fg-dim2); font-weight: 400; margin-left: 8px; letter-spacing: 0; }
+
+.stat { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.stat .k { color: var(--fg-dim2); font-size: 12px; }
+.stat .v { font-family: var(--mono); font-size: 13px; color: var(--fg); }
+
+#dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #555; display: inline-block; margin-right: 6px;
+  box-shadow: 0 0 8px rgba(0,0,0,.6);
+}
+#dot.on  { background: var(--ok);    box-shadow: 0 0 8px var(--ok); }
+#dot.off { background: var(--err);   box-shadow: 0 0 8px var(--err); }
+#dot.wait{ background: var(--tx);    box-shadow: 0 0 8px var(--tx); }
+
+.count-rx { color: var(--rx); }
+.count-tx { color: var(--tx); font-weight: 600; }
+.count-fail { color: var(--err); font-weight: 600; }
+.count-fail.zero { color: var(--fg-dim2); font-weight: 400; }
+.stat .v.hot { text-shadow: 0 0 8px currentColor; }
+#err { color: var(--err); font-size: 12px; max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
+.count-tx { color: var(--tx); }
+
+.spacer { flex: 1 1 auto; }
+
+/* ---------------------------------------------------------------- 按钮/控件 */
+button {
+  font-family: var(--ui);
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg-panel2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:hover  { background: #2a3242; border-color: #3b465a; }
+button:active { transform: translateY(1px); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent2); border-color: #4a90d9; color: #fff; }
+button.primary:hover { background: #3b8fe0; }
+button.danger  { background: #5b2626; border-color: #7d3535; }
+button.danger:hover { background: #743030; }
+button.on { background: #1f6b45; border-color: #2c8d5d; color: #eafff3; }
+button.tiny { padding: 2px 7px; font-size: 12px; }
+
+input[type=text], input[type=number], select {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 3px 5px;
+  box-sizing: border-box;              /* 宽度算上边框/内边距，别把字挤没 */
+  min-width: 72px;                     /* 所有数值框的最小宽度（原来太窄只显示一个字符） */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+input[type=number] { text-align: right; }             /* 数字右对齐 */
+input[type=text]   { text-align: center; }
+input:focus, select:focus { outline: 1px solid var(--accent2); border-color: var(--accent2); }
+input[type=checkbox] { accent-color: var(--accent2); vertical-align: middle; margin: 0 3px 0 0; }
+select { font-family: var(--ui); text-align: left; }
+label.chk {
+  display: inline-flex; align-items: center; gap: 4px;
+  white-space: nowrap; cursor: pointer;
+  min-width: 0; padding: 1px 2px;       /* 自适应宽度，不靠负 margin/绝对定位 → 不压邻居 */
+}
+
+/* ---------------------------------------------------------------- 布局 */
+main {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  gap: 1px;
+  background: var(--line);
+}
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+}
+#panel-rx { flex: 1 1 58%; }
+#panel-tx { flex: 1 1 42%; min-width: 430px; }
+
+/* 窄屏（≈1280 及以下）就把两块面板竖着叠，右边卡片不再被压扁 */
+@media (max-width: 1200px) {
+  main { flex-direction: column; overflow: auto; }
+  #panel-rx { flex: 0 0 auto; min-height: 300px; }
+  #panel-tx { flex: 1 1 auto; min-width: 0; }
+}
+
+.panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 7px 10px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+}
+.panel-head h2 {
+  margin: 0 4px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.panel-head .hint { color: var(--fg-dim2); font-size: 12px; }
+.panel-body { flex: 1 1 auto; overflow: auto; min-height: 0; }
+
+/* ---------------------------------------------------------------- 接收表 */
+table.frames { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+table.frames thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg-panel2);
+  color: var(--fg-dim);
+  font-weight: 600;
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+table.frames td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  white-space: nowrap;
+  vertical-align: top;
+}
+table.frames tr.rx td.d-id { color: var(--rx); }
+table.frames tr.tx td.d-id { color: var(--tx); }
+table.frames tr.tx { background: rgba(255,196,107,.055); }
+table.frames tr.unknown td.dec { color: var(--fg-dim2); }
+table.frames td.dec { white-space: normal; color: var(--fg); }
+table.frames td.d-data { letter-spacing: .3px; }
+table.frames td.d-dlc, table.frames td.d-dir { color: var(--fg-dim); }
+table.frames tr.newrow { animation: flash .55s ease-out; }
+@keyframes flash { from { background: rgba(77,163,255,.22); } to { background: transparent; } }
+
+/* ---------------------------------------------------------------- 发送区 */
+.sec { border-bottom: 1px solid var(--line-soft); padding: 9px 10px 11px; min-width: 0; }
+.sec > h3 {
+  margin: 0 0 7px;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  font-weight: 600;
+  letter-spacing: .4px;
+}
+.row { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; }
+.row + .row { margin-top: 6px; }
+
+/* 静态车况 / 里程油耗组：两列网格，列内是"标签 + 输入框 + 单位"，
+   一律用 column-gap，不用绝对定位或负 margin → 1280 宽下也不会横向溢出 */
+.grid-static {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 18px;
+  row-gap: 7px;
+}
+@media (max-width: 900px) { .grid-static { grid-template-columns: minmax(0, 1fr); } }
+.grid-static .g {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 4px 6px; min-width: 0;
+}
+.grid-static .g > span:first-child {
+  color: var(--fg-dim); font-size: 12px;
+  flex: 0 0 66px; width: 66px;          /* 标签固定宽度 → 右侧输入框永远对齐、不重叠 */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.grid-static input[type=number] { flex: 0 0 auto; width: 84px; min-width: 84px; }
+.grid-static select { flex: 0 0 auto; width: 84px; min-width: 84px; }
+.grid-static .badge { flex: 0 0 auto; }
+
+/* 发送表比较宽：让它自己在容器里横向滚动，卡片本身永远不溢出 */
+.table-wrap { width: 100%; max-width: 100%; overflow-x: auto; }
+table.edit { width: 100%; min-width: 720px; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+table.edit th {
+  color: var(--fg-dim); font-weight: 600; text-align: left;
+  padding: 3px 5px; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+table.edit td { padding: 2px 5px; border-bottom: 1px solid var(--line-soft); }
+table.edit input { min-width: 0; padding: 2px 4px; }
+table.edit input.b-id   { width: 68px; }
+table.edit input.b-byte { width: 34px; text-align: center; }
+table.edit input.b-per  { width: 66px; }
+table.edit input.b-cnt  { width: 58px; }
+table.edit tr.running { background: rgba(85,214,139,.09); }
+table.edit td.mid { text-align: center; }
+table.edit td.ops { white-space: nowrap; }
+table.edit td.ops button { padding: 1px 5px; font-size: 11.5px; margin-right: 1px; }
+
+#log {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--bg-input);
+  border-top: 1px solid var(--line);
+  padding: 4px 8px;
+  max-height: 108px;
+  overflow: auto;
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+}
+#log .e { color: var(--err); }
+#log .w { color: var(--warn); }
+#log .a { color: var(--accent); }
+
+/* 车况状态小标签（静态车况回显用） */
+#staticPreview {
+  font-family: var(--mono); font-size: 12px; color: var(--fg-dim);
+  margin-top: 6px; word-break: break-all; line-height: 1.5;
+}
+
+.badge {
+  display: inline-block; padding: 0 5px; border-radius: 3px;
+  background: var(--bg-panel2); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11.5px; color: var(--fg-dim);
+}
+.badge.live { color: var(--rx); border-color: #2f6b4b; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-input); }
+::-webkit-scrollbar-thumb { background: #333c4d; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #43506a; }

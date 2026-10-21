@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RK3506B 车机 CAN 调试台</title>
+<!-- 纯静态：不引任何外网资源（无 CDN / 无字体 / 无框架）。全部文件在本目录。 -->
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======================= 顶栏：连接状态 / 通道 / 波特率 / 计数 / 清空 ======= -->
+<header>
+  <div class="brand">RK3506B 车机 CAN 调试台<small id="ver">本地桥接</small></div>
+
+  <div class="stat"><span id="dot" class="wait"></span><span class="v" id="conn">连接中…</span></div>
+  <div class="stat"><span class="k">通道</span><span class="v" id="channel">—</span></div>
+  <div class="stat"><span class="k">波特率</span><span class="v" id="bitrate">—</span></div>
+  <div class="stat"><span class="k">后端</span><span class="v" id="backend">—</span></div>
+  <div class="stat"><span class="k">RX</span><span class="v count-rx" id="rx">0</span></div>
+  <div class="stat" title="成功写进总线的帧数（点一下发送，这个数就该涨）"><span class="k">TX 成功</span><span class="v count-tx" id="tx">0</span></div>
+  <div class="stat" title="发送失败的帧数；失败原文看右边红字和日志区"><span class="k">TX 失败</span><span class="v count-fail" id="txfail">0</span></div>
+  <div class="stat" title="还排在后台定时器里、没发完的帧数"><span class="k">待发</span><span class="v" id="txqueued">0</span></div>
+  <div class="stat"><span class="k">表中</span><span class="v" id="rows">0</span><span class="k" id="rowsCap">/300</span></div>
+
+  <div class="spacer"></div>
+  <div class="stat" id="err"></div>
+  <button id="btnClear" class="danger" title="清空接收区并清零 RX/TX 计数">清空</button>
+</header>
+
+<main>
+  <!-- ======================= 接收区 ==================================== -->
+  <section class="panel" id="panel-rx">
+    <div class="panel-head">
+      <h2>接收区</h2>
+      <span class="badge" id="rxState">接收中</span>
+      <button id="btnPause">暂停</button>
+      <button id="btnCsv">导出 CSV</button>
+      <label class="chk"><input type="checkbox" id="chkAutoScroll" checked>自动滚动</label>
+      <label class="chk"><input type="checkbox" id="chkDown">只看下行 100~105</label>
+      <label class="chk"><input type="checkbox" id="chkUp">只看上行 201~204</label>
+      <label class="chk" title="只渲染最近 200 行（更省 CPU）；关掉则最多 300 行"><input type="checkbox" id="chkRecent">只显示最近 200</label>
+      <span class="hint">最多保留 300 行 · 暂停时不再碰 DOM（帧仍计入导出）</span>
+    </div>
+    <div class="panel-body" id="rxBody">
+      <table class="frames">
+        <thead>
+          <tr>
+            <th style="width:96px">时间</th>
+            <th style="width:40px">方向</th>
+            <th style="width:62px">ID</th>
+            <th style="width:34px">DLC</th>
+            <th style="width:190px">数据（8 字节 HEX）</th>
+            <th>解码</th>
+          </tr>
+        </thead>
+        <tbody id="rxTbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ======================= 发送区 ==================================== -->
+  <section class="panel" id="panel-tx">
+    <div class="panel-head">
+      <h2>发送区</h2>
+      <span class="hint">ID 支持十进制 256 或十六进制 0x100</span>
+    </div>
+    <div class="panel-body">
+
+      <!-- ---- 一键预设 ---- -->
+      <div class="sec">
+        <h3>一键预设</h3>
+        <div class="row">
+          <button id="btnTimeline" class="primary" title="怠速→加速到 66→左转→刹车→安全带未系→左前门开→倒车→停车，每 100 ms 发 0x100/0x101/0x102，约 30 秒一轮，可循环">
+            ▶ 开车时间线（30 s 循环）
+          </button>
+          <button id="btnStaticToggle" class="primary" title="把下面「静态车况」的一组帧按 100 ms 周期持续发">▶ 静态车况（周期发）</button>
+          <button id="btnMileage" title="0x103 + 0x104 + 0x105 各发 1 次（点一下不会灌总线）">发 里程油耗组（各 1 次）</button>
+          <button id="btnMileageLoop" class="primary" title="0x103 + 0x104 + 0x105 按上面周期循环，让状态页持续有数">▶ 里程油耗组（循环）</button>
+          <button id="btnFault" title="0x104 发动机故障 + 胎压报警 + 故障码 P0301，各发 1 次">发 故障演示（各 1 次）</button>
+          <button id="btnFaultLoop" title="故障演示按 500 ms 循环">▶ 故障循环</button>
+          <button id="btnStopAll" class="danger">■ 全部停发</button>
+        </div>
+        <div class="row">
+          <span class="hint">工作模式（发 0x204，自动重发 3 次）：</span>
+          <button data-mode="0">经济</button>
+          <button data-mode="1">标准</button>
+          <button data-mode="2">运动</button>
+          <button data-mode="3">雪地</button>
+          <span id="modeState" class="badge">模式 —</span>
+        </div>
+        <div class="row" id="activeTimers"></div>
+      </div>
+
+      <!-- ---- 静态车况 ---- -->
+      <div class="sec">
+        <h3>静态车况（0x100 / 0x101 / 0x102 组帧，勾选后按下面周期发）</h3>
+        <div class="grid-static">
+          <div class="g"><span>车速</span><input type="number" id="sSpeed" min="0" max="254" value="66"><span class="badge">km/h</span></div>
+          <div class="g"><span>档位</span>
+            <select id="sGear"><option value="0">P</option><option value="1">R</option>
+              <option value="2">N</option><option value="3" selected>D</option></select></div>
+          <div class="g"><span>转速</span><input type="number" id="sRpm" min="0" max="255" value="8"><span class="badge">×100 rpm</span></div>
+          <div class="g"><span>车速无效</span><label class="chk"><input type="checkbox" id="sSpeedInvalid">无效(0xFF)</label></div>
+          <div class="g"><span>左转</span><label class="chk"><input type="checkbox" id="sLeft"></label></div>
+          <div class="g"><span>右转</span><label class="chk"><input type="checkbox" id="sRight"></label></div>
+          <div class="g"><span>刹车</span><label class="chk"><input type="checkbox" id="sBrake"></label></div>
+          <div class="g"><span>倒车</span><label class="chk"><input type="checkbox" id="sReverse"></label></div>
+          <div class="g"><span>安全带未系</span><label class="chk"><input type="checkbox" id="sSeatbelt"></label></div>
+          <div class="g"><span>手刹</span><label class="chk"><input type="checkbox" id="sHandbrake"></label></div>
+          <div class="g"><span>双闪</span><label class="chk"><input type="checkbox" id="sHazard"></label></div>
+        </div>
+        <div class="row" style="margin-top:7px">
+          <span class="hint">车门/舱盖（0x101 B0）：</span>
+          <label class="chk"><input type="checkbox" id="sDoor0">左前</label>
+          <label class="chk"><input type="checkbox" id="sDoor1">右前</label>
+          <label class="chk"><input type="checkbox" id="sDoor2">左后</label>
+          <label class="chk"><input type="checkbox" id="sDoor3">右后门</label>
+          <label class="chk"><input type="checkbox" id="sDoor4">后备箱</label>
+          <label class="chk"><input type="checkbox" id="sDoor5">引擎盖</label>
+          <label class="chk"><input type="checkbox" id="sLocked" checked>全车已锁</label>
+        </div>
+        <div class="row" style="margin-top:4px">
+          <span class="hint">灯光（0x102 B0）：</span>
+          <label class="chk"><input type="checkbox" id="sLight0" checked>近光</label>
+          <label class="chk"><input type="checkbox" id="sLight1">远光</label>
+          <label class="chk"><input type="checkbox" id="sLight2">示宽</label>
+          <label class="chk"><input type="checkbox" id="sLight3">前雾</label>
+          <label class="chk"><input type="checkbox" id="sLight4">后雾</label>
+          <label class="chk"><input type="checkbox" id="sLight5">氛围灯</label>
+          <label class="chk"><input type="checkbox" id="sAc" checked>AC</label>
+          <label class="chk"><input type="checkbox" id="sRecirc">内循环</label>
+          <div class="g"><span>空调温度</span><input type="number" id="sAcTemp" min="16" max="30" value="24"><span class="badge">℃</span></div>
+          <div class="g"><span>车外温度</span><input type="number" id="sOutTemp" min="-40" max="215" value="20"><span class="badge">℃</span></div>
+          <div class="g"><span>周期</span><input type="number" id="sPeriod" min="20" max="5000" value="100"><span class="badge">ms</span></div>
+        </div>
+        <div id="staticPreview">—</div>
+      </div>
+
+      <!-- ---- 里程油耗组（可编辑） ---- -->
+      <div class="sec">
+        <h3>里程 / 油耗 / 胎压组（0x103 / 0x104 / 0x105，500 ms 循环可改）</h3>
+        <div class="grid-static">
+          <div class="g"><span>总里程</span><input type="number" id="mTotal" min="0" max="1677721" value="10000"><span class="badge">0.1 km</span></div>
+          <div class="g"><span>小计</span><input type="number" id="mTrip" min="0" max="6553" value="80"><span class="badge">0.1 km</span></div>
+          <div class="g"><span>油量</span><input type="number" id="mFuel" min="0" max="100" value="50"><span class="badge">%</span></div>
+          <div class="g"><span>续航</span><input type="number" id="mRange" min="0" max="65535" value="600"><span class="badge">km</span></div>
+          <div class="g"><span>瞬时油耗</span><input type="number" id="mInst" min="0" max="255" value="65"><span class="badge">0.1 L/100km</span></div>
+          <div class="g"><span>平均油耗</span><input type="number" id="mAvg" min="0" max="255" value="74"><span class="badge">0.1 L/100km</span></div>
+          <div class="g"><span>模式</span>
+            <select id="mMode"><option value="0">经济</option><option value="1" selected>标准</option>
+              <option value="2">运动</option><option value="3">雪地</option></select></div>
+          <div class="g"><span>胎压 左前</span><input type="number" id="mP0" min="0" max="255" value="80"><span class="badge">×5 kPa</span></div>
+          <div class="g"><span>胎压 右前</span><input type="number" id="mP1" min="0" max="255" value="80"><span class="badge">×5 kPa</span></div>
+          <div class="g"><span>胎压 左后</span><input type="number" id="mP2" min="0" max="255" value="79"><span class="badge">×5 kPa</span></div>
+          <div class="g"><span>胎压 右后</span><input type="number" id="mP3" min="0" max="255" value="81"><span class="badge">×5 kPa</span></div>
+          <div class="g"><span>胎温 左前</span><input type="number" id="mT0" min="0" max="215" value="35"><span class="badge">℃</span></div>
+          <div class="g"><span>胎温 右前</span><input type="number" id="mT1" min="0" max="215" value="35"><span class="badge">℃</span></div>
+          <div class="g"><span>胎温 左后</span><input type="number" id="mT2" min="0" max="215" value="35"><span class="badge">℃</span></div>
+          <div class="g"><span>胎温 右后</span><input type="number" id="mT3" min="0" max="215" value="35"><span class="badge">℃</span></div>
+          <div class="g"><span>周期</span><input type="number" id="mPeriod" min="50" max="5000" value="500"><span class="badge">ms</span></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button id="btnMileageEdit" class="primary">▶ 按上面数值周期发送</button>
+          <span class="hint">0x103 B0..B2 总里程 24 位小端(0.1km) / B3..B4 小计 / B5 油量% / B6..B7 续航</span>
+        </div>
+        <div class="row" style="margin-top:4px">
+          <span class="hint">0x104 B0 瞬时 / B1 平均 / B2 模式 / B3 告警位 / B4 故障个数 / B5..B6 首个故障码</span>
+        </div>
+        <div class="row" style="margin-top:4px">
+          <span class="hint">0x105 B0..B3 左前/右前/左后/右后 胎压 ×5 kPa（0 无效）· B4..B7 胎温 = ℃+40</span>
+        </div>
+      </div>
+
+      <!-- ---- 可编辑发送表 ---- -->
+      <div class="sec">
+        <h3>发送表（可编辑多行：周期 / 次数 / 使能 / 启停）</h3>
+        <div class="table-wrap">
+        <table class="edit">
+          <thead>
+            <tr>
+              <th style="width:70px">ID(hex)</th>
+              <th>B0</th><th>B1</th><th>B2</th><th>B3</th><th>B4</th><th>B5</th><th>B6</th><th>B7</th>
+              <th style="width:74px">周期 ms</th>
+              <th style="width:56px">次数</th>
+              <th style="width:36px">使能</th>
+              <th style="width:86px">操作</th>
+              <th style="width:52px">解码</th>
+            </tr>
+          </thead>
+          <tbody id="txTbody"></tbody>
+        </table>
+        </div>
+        <div class="row" style="margin-top:7px">
+          <button id="btnAddRow" class="tiny">+ 加一行</button>
+          <button id="btnEchoStatic" class="tiny" title="把「静态车况」的数字填进发送表">← 用静态车况填表</button>
+          <button id="btnStartAll" class="tiny">▶ 启动全部已使能</button>
+          <button id="btnStopAllRows" class="tiny">■ 停止全部</button>
+          <span class="hint">「发」= 按「次数」发一次（<b>默认 1 帧</b>，一次最多 10 帧）；想让板子持续收到就点 ▶ 按周期一直发</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="log"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,105 @@
+#!/bin/sh
+#
+# S49can —— 开机把 can0 拉起来（500 kbit/s，采样点 87.0%，经典 CAN）
+# ============================================================================
+# 背景（踩过的坑，别再走一遍）：
+#   1) CAN 必须**编进内核**（CONFIG_CAN=y），不能用 insmod 模块。
+#      include/net/net_namespace.h 里 struct net 的 netns_can 字段被
+#      #if IS_ENABLED(CONFIG_CAN) 门控：模块以为自己能访问 net->can，
+#      但运行内核没有这个字段 -> 按错误偏移写 init_net -> 内存踩坏 ->
+#      随机时刻 Oops/panic（表象是"can0 up 就挂机"，极具误导性）。
+#   2) 驱动默认打开 CAN_CTRLMODE_FD，经典 CAN 必须显式 `fd off`。
+#   3) 本板采样点只能给到 87.0%（brp_inc=2 把 brp 锁成 6、tq=20ns、100tq/bit），
+#      PCAN-View 用标准 87.5% 一般也能通，出错误帧再自定义 Bit Timing。
+#
+# 用法： sh /etc/init.d/S49can {start|stop|status}
+#
+set -u
+
+IFACE="${SMARTCAR_CAN_IFACE:-can0}"
+BITRATE="${SMARTCAR_CAN_BITRATE:-500000}"
+SAMPLE_POINT="${SMARTCAR_CAN_SAMPLE_POINT:-0.870}"
+LOG=/var/log/smartcar-bt.log
+
+log() { echo "$(date '+%m-%d %H:%M:%S') S49can: $*" >> "$LOG" 2>/dev/null; }
+
+can_up() { ip -o link show "$IFACE" 2>/dev/null | grep -q ",UP"; }
+
+do_start() {
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        echo "FAIL:$IFACE 不存在（内核没编 CAN？uname -v 看内核版本）"
+        log "$IFACE 不存在"
+        return 1
+    fi
+    # 先 down 再按参数配置，避免旧参数残留
+    ip link set "$IFACE" down 2>/dev/null
+    if ! ip link set "$IFACE" type can bitrate "$BITRATE" sample-point "$SAMPLE_POINT" fd off 2>/dev/null; then
+        # 有些 iproute2 版本不认 fd off：退一步只设速率
+        ip link set "$IFACE" type can bitrate "$BITRATE" sample-point "$SAMPLE_POINT" 2>/dev/null
+    fi
+    ip link set "$IFACE" up || { echo "FAIL:ip link set $IFACE up 失败"; return 1; }
+    log "$IFACE up: bitrate=$BITRATE sp=$SAMPLE_POINT"
+    echo "OK:$IFACE up ($BITRATE bps, 采样点 $SAMPLE_POINT)"
+
+    # CAN 守护进程：独立于车机界面，把总线上所有帧记进 /var/log/smartcar-can.log
+    # （界面没跑/崩了的时候，现场排障就看这份日志）。SMARTCAR_CAND=0 可以关掉。
+    if [ "${SMARTCAR_CAND:-1}" != "0" ] && [ -x /userdata/smart_car/smartcar-cand ]; then
+        if ! pidof smartcar-cand >/dev/null 2>&1; then
+            /userdata/smart_car/smartcar-cand -d -i "$IFACE" \
+                -l /var/log/smartcar-can.log >/dev/null 2>&1
+            sleep 1
+        fi
+        if pidof smartcar-cand >/dev/null 2>&1; then
+            echo "OK:smartcar-cand 已常驻（日志 /var/log/smartcar-can.log）"
+            log "smartcar-cand started"
+        else
+            echo "WARN:smartcar-cand 没起来（不影响车机界面收发）"
+            log "smartcar-cand failed"
+        fi
+    fi
+    return 0
+}
+
+do_stop() {
+    if pidof smartcar-cand >/dev/null 2>&1; then
+        kill $(pidof smartcar-cand) 2>/dev/null
+        sleep 1
+        rm -f /var/run/smartcar-cand.pid
+        log "smartcar-cand stopped"
+    fi
+    ip link set "$IFACE" down 2>/dev/null
+    log "$IFACE down"
+    echo "OK:$IFACE down"
+    return 0
+}
+
+do_status() {
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        echo "$IFACE 不存在"
+        return 2
+    fi
+    ip -d link show "$IFACE" | sed -n '1,4p'
+    echo "--- 收发计数 ---"
+    ip -s -d link show "$IFACE" | sed -n '5,8p'
+    if [ -r /proc/net/can/stats ]; then
+        echo "--- /proc/net/can/stats ---"
+        cat /proc/net/can/stats
+    fi
+    echo "--- CAN 守护进程 ---"
+    if pidof smartcar-cand >/dev/null 2>&1; then
+        echo "smartcar-cand 运行中 (pid $(pidof smartcar-cand))，日志 /var/log/smartcar-can.log"
+        ls -l /var/log/smartcar-can.log 2>/dev/null
+        tail -3 /var/log/smartcar-can.log 2>/dev/null
+    else
+        echo "smartcar-cand 未运行"
+    fi
+    can_up && return 0 || return 2
+}
+
+case "${1:-start}" in
+    start)  do_start ;;
+    stop)   do_stop ;;
+    restart) do_stop; sleep 1; do_start ;;
+    status) do_status ;;
+    *) echo "用法: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

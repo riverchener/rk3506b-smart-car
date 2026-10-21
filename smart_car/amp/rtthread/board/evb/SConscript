@@ -1,0 +1,11 @@
+Import('RTT_ROOT')
+Import('rtconfig')
+from building import *
+
+cwd = GetCurrentDir()
+src = sorted(Glob('*.c'), key=lambda n: str(n))
+CPPPATH = [cwd, str(Dir('#'))]
+
+group = DefineGroup('Board', src, depend=[''], CPPPATH=CPPPATH)
+
+Return('group')

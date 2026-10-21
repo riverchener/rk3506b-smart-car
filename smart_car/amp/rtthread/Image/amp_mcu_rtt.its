@@ -1,0 +1,65 @@
+/*
+ * Copyright (C) 2024 Rockchip Electronics Co., Ltd
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ *
+ * FIT image for the RK3506 M0 when it runs RT-Thread.
+ *
+ *   data  = the RT-Thread build output (rtthread.bin, copied to mcu.bin)
+ *   load  = 0xfff84000 - the 32 KiB SRAM/TCM window U-Boot hands to the M0
+ *           via sip_smc_mcu_config(MCU_CODE_START_ADDR, entry_point).  The M0
+ *           sees that same window at its own address 0, which is why
+ *           gcc_link.ld.S declares RAM at ORIGIN = 0x0 LENGTH = 0x8000.
+ *
+ * This file is the RT-Thread twin of device/rockchip/.chips/rk3506/amp_mcu.its,
+ * which points at the bare-metal HAL project.  The only functional difference
+ * is the payload; `sys`/`core` are what mk-amp.sh switches on, so a defconfig
+ * can pick the RT-Thread build with:
+ *
+ *     RK_AMP_FIT_ITS="amp_mcu_rtt.its"
+ *     RK_AMP_MCU_RTT_TARGET="rk3506-mcu"
+ *
+ * (see docs/M0_RTThread移植说明.md for the standalone, non-invasive flow that
+ *  build_m0_rtt.sh uses instead).
+ */
+
+/dts-v1/;
+/ {
+	description = "Rockchip AMP FIT Image (RK3506 M0 / RT-Thread)";
+	#address-cells = <1>;
+
+	images {
+		mcu {
+			description  = "mcu-rtthread";
+			data         = /incbin/("./mcu.bin");
+			type         = "standalone";	// must be "standalone"
+			compression  = "none";
+			arch         = "arm";		// "arm64" or "arm", the same as U-Boot state
+			load         = <0xfff84000>;
+			udelay       = <1000000>;
+			compile {
+				sys      = "rtt";
+				core     = "mcu";
+			};
+			hash {
+				algo = "sha256";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf";
+		conf {
+			description = "Rockchip AMP images";
+			rollback-index = <0x0>;
+			loadables = "mcu";
+
+			signature {
+				algo = "sha256,rsa2048";
+				padding = "pss";
+				key-name-hint = "dev";
+				sign-images = "loadables";
+			};
+		};
+	};
+};

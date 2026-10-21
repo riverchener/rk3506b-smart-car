@@ -1,0 +1,101 @@
+#!/bin/sh
+# Smart_car autostart: AMP sensor bridge (M0) + buzzer mute + Qt HMI.
+#
+# The environment sensors (DHT11 / SR04 / buzzer) are owned and sampled by the
+# Cortex-M0 firmware since the AMP rework:
+#   M0  ->  rpmsg service "rpmsg-smartcar"  ->  sc_sensors.ko  ->  /dev/mydht11
+#                                                                /dev/mysr04
+#                                                                /dev/mybuzzer
+# so sc_sensors.ko replaces smartcar_hw.ko here.  If sc_sensors cannot attach
+# (for example the M0 is not running because the board was only warm-rebooted),
+# we fall back to the old Linux-side driver so the car system still works.
+#
+# QT_QPA_PLATFORM=wayland is REQUIRED -- the rootfs has no eglfs plugin, so Qt
+# otherwise dies with: Could not find the Qt platform plugin "eglfs".
+
+CONF=/userdata/smart_car/smartcar.conf
+PIN=52
+BUZZ=1
+[ -r "$CONF" ] && . "$CONF"
+[ -n "$SMARTCAR_DHT11_PIN" ] && PIN=$SMARTCAR_DHT11_PIN
+[ -n "$SMARTCAR_BUZZER_ACTIVE_LOW" ] && BUZZ=$SMARTCAR_BUZZER_ACTIVE_LOW
+
+export XDG_RUNTIME_DIR=/var/run
+export WAYLAND_DISPLAY=wayland-0
+export QT_QPA_PLATFORM=wayland
+export QT_QUICK_BACKEND=software
+export QT_QPA_FONTDIR=/usr/share/fonts
+export WAYLANDSINK_FORCE_DMABUF=1
+export LD_LIBRARY_PATH=/userdata/smart_car
+
+# ---------------------------------------------------------------- locale (重要!)
+# Qt 的 QString <-> 本地 8bit 转换用的是 **locale 的 codec**（QFile::encodeName、
+# QString::toLocal8Bit、QUrl::fromLocalFile 都走它）。没有 LANG 时 glibc 报
+# ANSI_X3.4-1968，Qt 把中文转成 '?'/latin1 字节，于是：
+#   - 界面与日志里的中文全变成 ??????（乱码）
+#   - 中文文件名的音视频打不开：GStreamer ... "Resource not found."
+# 系统本来在 /etc/profile.d/lang.sh 里定了 en_US.UTF-8，但那是 **login shell** 才读的，
+# init 直接拉起的进程拿不到 —— 手工从 adb shell 启动 app 就正常，就是这个原因。
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+# /dev/mybuzzer write(): 2 bytes, byte[1] != 0 means "sound"; {0,0} = silence.
+# Done here so a crashed app cannot leave the buzzer screaming.
+silence_buzzer() {
+    [ -e /dev/mybuzzer ] || return 0
+    printf '\000\000' > /dev/mybuzzer 2>/dev/null && echo -n "[buzzer muted] "
+}
+
+load_sensors() {
+    # the M0 must own GPIO52/54/55/56 -> drop the old pin-owning driver
+    if lsmod | grep -q '^smartcar_hw'; then
+        rmmod smartcar_hw 2>/dev/null && echo -n "[smartcar_hw unloaded] "
+    fi
+
+    if lsmod | grep -q '^sc_sensors'; then
+        return 0
+    fi
+
+    if insmod /userdata/smart_car/sc_sensors.ko 2>/dev/null; then
+        echo -n "[AMP sensors: M0 via rpmsg] "
+        return 0
+    fi
+
+    echo -n "[sc_sensors failed, falling back to smartcar_hw] "
+    insmod /userdata/smart_car/smartcar_hw.ko dht11_pin=$PIN buzzer_active_low=$BUZZ \
+        || echo -n "[insmod failed] "
+}
+
+start() {
+    echo -n "starting smartcar... "
+
+    load_sensors
+    silence_buzzer
+
+    counter=0
+    while [ ! -e "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ] && [ $counter -lt 100 ]; do
+        sleep 0.1
+        counter=$((counter + 1))
+    done
+
+    if ! pidof Smart_in-car_entertainment >/dev/null 2>&1; then
+        cd /userdata/smart_car || return 1
+        /userdata/smart_car/Smart_in-car_entertainment > /var/log/smartcar.log 2>&1 &
+    fi
+    echo "done."
+}
+
+stop() {
+    echo -n "stopping smartcar... "
+    killall Smart_in-car_entertainment 2>/dev/null
+    silence_buzzer
+    echo "done."
+}
+
+case "$1" in
+    start) start ;;
+    stop)  stop ;;
+    restart|reload) stop; sleep 1; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0

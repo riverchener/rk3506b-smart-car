@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "product": "Smart_car RK3506B 车机",
+  "version": "1.6.0",
+  "released_at": "2026-10-18 23:03:03",
+  "notes": "桌面壁纸换新图（1280x720）；OTA 演练 1.6.0",
+  "app_file": "app-1.6.0.tar.gz",
+  "app_size": 1642965,
+  "app_md5": "0305f8593d6f79163561983f1ae8b7b4",
+  "app_elf_version": "1.6.0",
+  "app_source_md5": "4196912e206efcb4485ec5d742c21c7f",
+  "firmware": []
+}

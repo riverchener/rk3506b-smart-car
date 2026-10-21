@@ -1,0 +1,289 @@
+#!/bin/sh
+#
+# S47wifi —— 开机自动搜索并连接已保存的 WiFi（USB WiFi = RTL8733BU，接口 wlan0）
+#
+# 逻辑：
+#   1) 解除 rfkill 软锁，拉起 wlan0
+#   2) 用 wpa_supplicant 扫描，逐个尝试“已保存”的网络（越靠前优先级越高）
+#   3) 连上后 udhcpc 拿 IP、修 DNS
+#   4) 成功则写 /var/run/smartcar-net.status（OK:<SSID>:<IP>），
+#      应用读到后会在屏幕上弹“已成功连接网络！”
+#
+# 配置：
+#   /etc/wpa_supplicant-smartcar.conf  —— 已保存的 WiFi（一个 network{} 一块）
+#   /etc/smartcar.conf 里的 SMARTCAR_WIFI_IFACE 可改网卡名
+#
+### BEGIN INIT INFO
+# Provides:          smartcar-wifi
+# Required-Start:    mountvirtfs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Auto-connect saved WiFi on boot
+### END INIT INFO
+
+CONF=/etc/wpa_supplicant-smartcar.conf
+LOG=/var/log/smartcar-wifi.log
+
+# ---------------------------------------------------------------------------
+# 诊断追踪：只有存在 /userdata/wifi-diag.on 时才记录。
+# 写 /userdata（真 flash）而不是 /var/log（内存盘，重启就清空），
+# 这样开机过程能被完整保留下来，方便定位"开机不自动连"这类问题。
+#   开启： touch /userdata/wifi-diag.on
+#   关闭： rm /userdata/wifi-diag.on
+#   查看： cat /userdata/wifi-diag.log
+# ---------------------------------------------------------------------------
+DIAG=/userdata/wifi-diag.log
+diag() {
+    [ -f /userdata/wifi-diag.on ] || return 0
+    echo "$(date '+%m-%d %H:%M:%S') [up$(cut -d. -f1 /proc/uptime)s] $*" >> "$DIAG"
+}
+STATUS=/var/run/smartcar-net.status
+IFACE=wlan0
+[ -f /etc/smartcar.conf ] && . /etc/smartcar.conf
+[ -n "$SMARTCAR_WIFI_IFACE" ] && IFACE="$SMARTCAR_WIFI_IFACE"
+
+write_status() {
+    # $1 = OK|FAIL|DOWN，其余参数 = 明细行
+    {
+        printf '%s\n' "$1"
+        shift
+        for a in "$@"; do printf '%s\n' "$a"; done
+    } > "$STATUS.tmp" 2>/dev/null && mv "$STATUS.tmp" "$STATUS"
+}
+
+# 写“连接成功”状态：第1行 OK / 第2行 SSID / 第3行 IP
+write_connected() {
+    printf 'OK\n%s\n%s\n' "$1" "$2" > "$STATUS.tmp" 2>/dev/null && mv "$STATUS.tmp" "$STATUS"
+}
+
+# 写“已断开”状态：第1行 DOWN / 第2行 原因
+write_down() {
+    printf 'DOWN\n%s\n' "$1" > "$STATUS.tmp" 2>/dev/null && mv "$STATUS.tmp" "$STATUS"
+}
+
+# wpa_cli/iw 对非 ASCII 的 SSID 会输出成 \xe4\xb8\x80... 这种转义形式。
+# 这里把转义还原成真正的 UTF-8 字节，弹窗才能显示中文名字。
+decode_ssid() {
+    esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/\\\\x/\\x/g')
+    printf '%b' "$esc"
+}
+
+fix_dns() {
+    DNS1=$(sed -n 's/^nameserver \([0-9.]*\).*/\1/p' /tmp/resolv.conf.udhcpc 2>/dev/null | grep -v 127.0.0.1 | head -1)
+    [ -n "$DNS1" ] || DNS1=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+    {
+        echo "# smartcar: DHCP + 公共 DNS（connman 的 127.0.0.1 DNS 代理在本固件里解析不了域名）"
+        [ -n "$DNS1" ] && echo "nameserver $DNS1"
+        echo "nameserver 223.5.5.5"
+        echo "nameserver 114.114.114.114"
+    } > /etc/resolv.conf
+    echo "$(date): resolv.conf -> $DNS1" >> "$LOG"
+}
+
+start() {
+    diag "start 被调用 (arg=$1)"
+    [ -f "$CONF" ] || { echo "$(date): $CONF 不存在，跳过 WiFi" >> "$LOG"; diag "无配置文件，跳过"; return 0; }
+
+    # 无论如何都先把 connman 从 wlan0 上赶走，否则 connman 会自己去连。
+    connmanctl disable wifi >/dev/null 2>&1
+    rfkill unblock all >/dev/null 2>&1
+
+    # ------------------------------------------------------------------
+    # 【默认】开机**不自动连接** WiFi。
+    #
+    # 原因：这块板子是 WiFi+BT 二合一芯片（RTL8733BU），两者共用一根 2.4G 天线。
+    # 开机就把 WiFi 连上会占用射频和 IP 配置（还会 killall udhcpc，
+    # 把 eth0 的 DHCP 客户端一起干掉），对蓝牙配对/音频没有好处。
+    #
+    # WiFi 仍然可以**在应用界面里手动连**（wifi-ctl enable 自己会拉起
+    # wpa_supplicant 并 DHCP，不依赖这个脚本）。
+    #
+    # 想让开机自动连：在 /etc/smartcar.conf 里加
+    #     SMARTCAR_WIFI_AUTOCONNECT=1
+    # ------------------------------------------------------------------
+    if [ "${SMARTCAR_WIFI_AUTOCONNECT:-0}" != "1" ]; then
+        echo "$(date): SMARTCAR_WIFI_AUTOCONNECT != 1，开机不自动连 WiFi（应用里手动连）" >> "$LOG"
+        diag "开机不自动连 WiFi（需要的话设 SMARTCAR_WIFI_AUTOCONNECT=1）"
+        return 0
+    fi
+
+    diag "connman/rfkill 处理完成，wlan0 存在=$([ -e /sys/class/net/$IFACE ] && echo yes || echo no)"
+
+    # ------------------------------------------------------------------
+    # 【重要】整个"等网卡 + 连接"的过程放到后台跑，并且必须用 setsid 脱离会话！
+    #
+    # 两个坑：
+    #  1) 本脚本是开机同步执行的（S47 在 S49weston / S99appinit 之前），
+    #     如果在里面等 USB 网卡枚举（可能 2 分钟以上），开机会被卡住。
+    #  2) 只写 `&` 不够！rcS 是用 `$i start` fork 子进程执行的，
+    #     脚本一返回，它的后台子进程会被一起回收 —— 表现为"手动跑能连，开机跑就不连"。
+    #     用 setsid 让任务脱离会话，才能活到网卡出现、连接完成。
+    # ------------------------------------------------------------------
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "$0 connect_worker" >/dev/null 2>&1 < /dev/null &
+    else
+        connect_worker >/dev/null 2>&1 < /dev/null &
+    fi
+    echo "$(date): WiFi 连接任务已在后台启动 (pid $!)" >> "$LOG"
+    return 0
+}
+
+# 后台执行的连接流程：等网卡 -> 关联 -> 拿 IP -> 写状态
+connect_worker() {
+    diag "connect_worker 启动"
+    killall wpa_supplicant >/dev/null 2>&1
+    killall udhcpc >/dev/null 2>&1
+
+    # ---------------------------------------------------------------
+    # 等 USB WiFi 网卡枚举出来。
+    # RTL8733BU 是 USB 设备，冷启动时可能要到开机后 2 分多钟才出现 wlan0；
+    # 用 0.2 秒粒度轮询，网卡一出现就立刻开始连，尽可能快。
+    # ---------------------------------------------------------------
+    echo "$(date): 等待网卡 $IFACE 出现..." >> "$LOG"
+    w=0
+    while [ $w -lt 1500 ]; do          # 1500 * 0.2s = 最多等 300 秒
+        [ -e "/sys/class/net/$IFACE" ] && break
+        w=$((w + 1))
+        usleep 200000 2>/dev/null || sleep 0.2
+    done
+    if [ ! -e "/sys/class/net/$IFACE" ]; then
+        echo "$(date): 等了约 $((w / 5))s 仍未见 $IFACE，放弃（WiFi 模块没插好？）" >> "$LOG"
+        diag "等网卡超时 ${w}/5 秒，放弃"
+        write_status "FAIL:WiFi 网卡未就绪"
+        return 0
+    fi
+    echo "$(date): $IFACE 已出现（约 $((w / 5))s）—— 立即开始连接" >> "$LOG"
+    diag "网卡就绪（等待 $((w / 5))s），开始设置链路"
+
+    # 网卡刚出现时可能还在初始化，稍等一下即可
+    sleep 1
+
+    ip link set "$IFACE" down >/dev/null 2>&1
+    ip link set "$IFACE" up >/dev/null 2>&1
+    sleep 1
+
+    echo "$(date): 开始连接已保存的 WiFi..." >> "$LOG"
+    wpa_supplicant -B -i "$IFACE" -c "$CONF" -Dnl80211 >>"$LOG" 2>&1
+    diag "wpa_supplicant 已启动"
+
+    # 等关联成功（RTL8733 冷启动偏慢，最多约 60 秒）
+    i=0
+    st=""
+    while [ $i -lt 60 ]; do
+        st=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p')
+        [ "$st" = "COMPLETED" ] && break
+        i=$((i + 1))
+        sleep 1
+    done
+    echo "$(date): wpa_state=$st (等待 ${i}s)" >> "$LOG"
+    diag "关联结果 wpa_state=$st (等待 ${i}s)"
+
+    if [ "$st" != "COMPLETED" ]; then
+        write_status "FAIL:未找到可连接的已保存网络"
+        return 0
+    fi
+
+    SSID_RAW=$(wpa_cli -i "$IFACE" status 2>/dev/null | grep '^ssid=' | cut -d= -f2-)
+    [ -z "$SSID_RAW" ] && SSID_RAW=$(iw dev "$IFACE" info 2>/dev/null | sed -n 's/^[[:space:]]*ssid[[:space:]]\+//p')
+    SSID_READABLE=$(decode_ssid "$SSID_RAW")
+    [ -z "$SSID_READABLE" ] && SSID_READABLE="$SSID_RAW"
+
+    udhcpc -i "$IFACE" -n -q -t 8 -T 3 >>"$LOG" 2>&1
+    IP=$(ip -4 addr show "$IFACE" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+    echo "$(date): 连上 '$SSID_READABLE'，IP=$IP" >> "$LOG"
+    diag "DHCP 结果: SSID='$SSID_READABLE' IP='$IP'"
+
+    # ------------------------------------------------------------------
+    # 关掉 WiFi 省电。
+    # RTL8733BU 是 WiFi+BT 二合一芯片，两者共用一根 2.4G 天线。
+    # 省电模式（Power save: on 是出厂默认）会让射频周期性休眠，
+    # 对蓝牙扫描/配对的共存影响很大 —— 实测本板关掉省电后，
+    # 同样 20 秒扫描抓到的蓝牙事件从 3 行涨到 9 行。
+    # 这是常驻服务，顺便也能让弱信号（实测 -80dBm）下链路稳一点。
+    # ------------------------------------------------------------------
+    iw dev "$IFACE" set power_save off 2>/dev/null \
+        && echo "$(date): 已关闭 $IFACE 省电（改善 WiFi/蓝牙共存）" >> "$LOG"
+
+    if [ -n "$IP" ]; then
+        fix_dns
+        # 状态文件按“行”存，避免中文 SSID 被 shell 按字节切坏：
+        #   第1行 OK / 第2行 SSID（UTF-8）/ 第3行 IP
+        write_connected "$SSID_READABLE" "$IP"
+        echo "$(date): 已写入 $STATUS" >> "$LOG"
+        diag "★ 连接成功，已写状态文件"
+        # 启动后台监测：掉线时写 DOWN
+        start_watcher
+    else
+        write_status "FAIL"
+        diag "✗ DHCP 没拿到 IP"
+    fi
+}
+
+# ---------------------------------------------------------------- 掉线监测
+# 每 5 秒看一次 wpa_supplicant 状态；检测到“连上 -> 断开”的跳变就写 DOWN，
+# 应用读到后会弹“网络已断开”提示。
+start_watcher() {
+    if [ -f /var/run/smartcar-wifi-watch.pid ] && \
+       kill -0 "$(cat /var/run/smartcar-wifi-watch.pid 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    (
+        was_conn=0
+        while :; do
+            st=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p')
+            if [ "$st" = "COMPLETED" ]; then
+                # 物理链路也确认一下
+                if ip -4 addr show "$IFACE" 2>/dev/null | grep -q 'inet '; then
+                    was_conn=1
+                fi
+            else
+                if [ "$was_conn" = "1" ]; then
+                    echo "$(date): 检测到掉线 (wpa_state=$st)" >> "$LOG"
+                    write_down "WiFi 连接已断开"
+                    was_conn=0
+                fi
+            fi
+            sleep 5
+        done
+    ) >/dev/null 2>&1 < /dev/null &
+    echo $! > /var/run/smartcar-wifi-watch.pid
+    echo "$(date): 掉线监测已启动 (pid $(cat /var/run/smartcar-wifi-watch.pid))" >> "$LOG"
+}
+
+stop() {
+    [ -f /var/run/smartcar-wifi-watch.pid ] && kill "$(cat /var/run/smartcar-wifi-watch.pid)" 2>/dev/null
+    rm -f /var/run/smartcar-wifi-watch.pid
+    # 连后台连接任务一起停掉，避免和下一次启动打架
+    [ -f /var/run/smartcar-wifi-worker.pid ] && kill "$(cat /var/run/smartcar-wifi-worker.pid)" 2>/dev/null
+    rm -f /var/run/smartcar-wifi-worker.pid
+    killall udhcpc >/dev/null 2>&1
+    killall wpa_supplicant >/dev/null 2>&1
+    echo "$(date): wifi stopped" >> "$LOG"
+}
+
+status() {
+    wpa_cli -i "$IFACE" status 2>/dev/null | head -6
+    ip -4 addr show "$IFACE" 2>/dev/null
+    echo "--- 状态文件 ---"
+    cat "$STATUS" 2>/dev/null || echo "(无)"
+    echo "--- 掉线监测 pid ---"
+    cat /var/run/smartcar-wifi-watch.pid 2>/dev/null || echo "(未运行)"
+}
+
+# 手动写一条“已断开”用于测试弹窗
+test_down() {
+    write_down "WiFi 连接已断开（测试）"
+    echo "已写入: $(cat "$STATUS")"
+}
+
+case "$1" in
+    start)          start ;;
+    stop)           stop ;;
+    restart)        stop; sleep 1; start ;;
+    status)         status ;;
+    test-down)      test_down ;;
+    # 供 setsid 后台调用的内部入口
+    connect_worker) connect_worker ;;
+    *)              echo "Usage: $0 {start|stop|restart|status|test-down}"; exit 1 ;;
+esac
+exit 0

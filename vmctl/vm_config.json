@@ -1,0 +1,7 @@
+{
+  "host": "192.168.88.130",
+  "port": 22,
+  "user": "cjh",
+  "password": "181305",
+  "sudo_password": "181305"
+}

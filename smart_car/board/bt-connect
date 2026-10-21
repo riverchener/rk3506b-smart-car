@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# bt-connect —— 连上手机（并让手机开始播放）
+#
+# 【为什么不能用 bluetoothctl connect】
+# 这个板子上的 BlueZ 被改过：org.bluez.Device1 的 Connect / Disconnect
+# **多了一个字符串参数**（ADDR_TYPE），原生 BlueZ 是不带参数的。
+# bluetoothctl 按"无参数"去调，于是永远失败：
+#   Failed to connect: org.freedesktop.DBus.Error.UnknownMethod
+#   Method "Connect" with signature "" on interface "org.bluez.Device1" doesn't exist
+# （Device1.Pair 确实没有参数，所以 `bluetoothctl pair` 是好的。）
+#
+# 所以这里直接 dbus-send，把那个参数补上空串。
+#
+# 用法：
+#   bt-connect                       # 自动挑第一个"已配对"的设备
+#   bt-connect FC:5B:8C:F7:D7:B3     # 指定地址
+set -u
+
+ADDR="${1:-}"
+if [ -z "$ADDR" ]; then
+    ADDR=$(bluetoothctl devices Paired 2>/dev/null | head -1 | awk '{print $2}')
+fi
+if [ -z "$ADDR" ]; then
+    echo "没有找到已配对的设备。先在手机蓝牙里配对 Smart_car。"
+    exit 1
+fi
+
+DEVPATH="/org/bluez/hci0/dev_$(echo "$ADDR" | tr ':' '_' | tr 'a-z' 'A-Z')"
+
+echo "连接 $ADDR ..."
+dbus-send --system --print-reply --dest=org.bluez "$DEVPATH" \
+    org.bluez.Device1.Connect string: >/dev/null 2>&1
+sleep 3
+
+if bluetoothctl info "$ADDR" 2>/dev/null | grep -q 'Connected: yes'; then
+    echo "已连接：$ADDR"
+else
+    echo "连接失败（确认手机蓝牙开着、在范围内、且已配对）"
+    exit 1
+fi
+
+# AVRCP：让手机开始播放（手机上音乐 App 里要已经有歌/歌单）
+dbus-send --system --print-reply --dest=org.bluez "$DEVPATH" \
+    org.bluez.MediaControl1.Play >/dev/null 2>&1 && \
+    echo "已发送播放指令；手机放歌即可从车机喇叭出声"
+exit 0

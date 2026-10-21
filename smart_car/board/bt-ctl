@@ -1,0 +1,711 @@
+#!/bin/sh
+#
+# bt-ctl —— 蓝牙音频开关 / 状态查询（和 wifi-ctl 对称）
+#
+# 蓝牙当"音箱"用需要两个东西同时跑：
+#   1) bluealsa        —— 以 A2DP Sink 身份注册媒体端点，
+#                         板子才会对外广告 "Audio Sink" 服务，
+#                         手机那边才看得到这台车机是音频设备
+#   2) bluealsa-aplay  —— 把蓝牙收到的音频流播到本地声卡（ES8388）
+#
+# 只跑 bluetoothd 是不够的：没有 bluealsa 时控制器 UUID 里没有
+# "Audio Sink (0000110b-...)"，手机配对后也不会把音频送过来。
+#
+# 用法：
+#   bt-ctl audio-on      启动 bluealsa(a2dp-sink) + bluealsa-aplay
+#   bt-ctl audio-off     停掉上面两个
+#   bt-ctl audio-status  ok / off （exit 0=ok, 2=off）
+#   bt-ctl status        蓝牙总状态：powered / connected 等（给应用读）
+#
+set -u
+
+# ⚠️ 必须自己把配置读进来：SMARTCAR_BT_STACK / SMARTCAR_BT_PCM 这些开关都在
+# /etc/smartcar.conf 里。以前只靠"调用者继承"（S98 启动的应用有），
+# 手工在串口/adb 里敲 `bt-ctl audio-on` 时就没有 → 静默走了 BlueALSA 分支，
+# 看起来像"PulseAudio 起不来"。这里自己 source，行为就和调用者无关了。
+[ -f /etc/smartcar.conf ] && . /etc/smartcar.conf 2>/dev/null
+[ -f /userdata/smart_car/smartcar.conf ] && . /userdata/smart_car/smartcar.conf 2>/dev/null
+
+IFACE=hci0
+LOG=/var/log/smartcar-bt.log
+APLAY_PID=/var/run/bluealsa-aplay.pid
+
+# A2DP sink 用哪个本地 PCM 播放。默认走系统 default（ES8388）。
+# 想指定：SMARTCAR_BT_PCM=hw:0,0
+PCM="${SMARTCAR_BT_PCM:-default}"
+
+log() { echo "$(date '+%m-%d %H:%M:%S') bt-ctl: $*" >> "$LOG"; }
+
+audio_running() {
+    pidof bluealsa >/dev/null 2>&1
+}
+
+do_audio_on() {
+    if ! audio_running; then
+        # 只做 A2DP Sink：手机把音频推过来，我们用 bluealsa-aplay 播到车机喇叭。
+        # （曾经还带 -p a2dp-source 用于"车机放歌给蓝牙耳机"，那条线已废弃，去掉。）
+        #
+        # 输出**不要**丢到 /dev/null：手机连不上时，bluealsa 的 stderr 里才有
+        # AVDTP 协商失败的原因（codec 不匹配 / endpoint 报错）。写到 /userdata
+        # （真 flash，重启不丢），方便排查。
+        #
+        # --keep-alive=10：**关键**。默认 keep-alive=0，意思是"没有 PCM 客户端
+        # 读数据就立刻把 transport 放掉"。手机刚 SetConfiguration/Open 完、
+        # bluealsa-aplay 还没把 PCM 打开的那一瞬间，transport 就被 free 了，
+        # 手机看到流被关掉 → AVDTP Abort → 手机侧报"连接失败"。
+        # 日志里的证据：ba-transport.c:610 "PCM clients check keep-alive: 0 ms"。
+        setsid bluealsa -p a2dp-sink --keep-alive=10 > /userdata/bluealsa.log 2>&1 < /dev/null &
+        sleep 2
+        log "bluealsa 已启动 (a2dp-sink, keep-alive=10)，日志 /userdata/bluealsa.log"
+    else
+        log "bluealsa 已在运行"
+    fi
+
+    # 不需要往 asound.conf 里 include bluealsa 定义：系统 alsa.conf 会自动扫描
+    # /etc/alsa/conf.d，pcm.bluealsa 本来就能直接引用（详见文件末尾注释）。
+
+    if ! pidof bluealsa-aplay >/dev/null 2>&1; then
+        # 00:00:00:00:00:00 = 接受任意已连接设备的音频
+        # 输出同样别丢 /dev/null：它"打开了 ALSA 却又退出"是我们排查
+        # "连上了没声音"的唯一线索（aplay.c:739 ALSA playback PCM underrun 等）。
+        #
+        # --pcm-buffer-time / --pcm-period-time：蓝牙过来的数据是**突发**的
+        # （SBC 一帧一帧到），默认缓冲偏小，一开就 underrun，日志里能看到
+        # 连续 "ALSA playback PCM underrun"，随后 aplay 会把设备标成 inactive
+        # 并关掉 ALSA —— 设备一关，bluealsa 过了 keep-alive 就放掉 transport，
+        # 手机那边看到流被关就 Suspend，表现就是"放两秒就断"。
+        # 把缓冲放大到 250ms（周期 50ms）能明显抗抖动。
+        # 缓冲深度（us）。**这是治卡顿的主要旋钮**，见文件头/issue 记录：
+        #   WiFi 与蓝牙是同一颗 RTL8733BU（共用射频），WiFi 实测 -78dBm 弱信号
+        #   反复重传时会长时间占用射频，这期间 A2DP 收不到包 → "时不时卡一下"。
+        #   把本地播放缓冲加深，就能把这几个百毫秒的"射频空窗"吃掉。
+        #   250ms（旧值）在弱 WiFi + 共存的环境下不够。
+        ABUF="${SMARTCAR_BT_AUDIO_BUFFER_US:-500000}"
+        APER="${SMARTCAR_BT_AUDIO_PERIOD_US:-50000}"
+        setsid bluealsa-aplay -D "$PCM" --pcm-buffer-time="$ABUF" --pcm-period-time="$APER" \
+            00:00:00:00:00:00 \
+            >/userdata/bluealsa-aplay.log 2>&1 < /dev/null &
+        echo $! > "$APLAY_PID"
+        sleep 1
+        log "bluealsa-aplay 已启动 (PCM=$PCM, buffer=${ABUF}us period=${APER}us，日志 /userdata/bluealsa-aplay.log)"
+    fi
+
+    # 手机音频别因为本地静音而没声：拉到中高音量。
+    # 注意控件名：本板 ES8388 是 'Master' / 'Speaker' / 'Headphone' / 'PCM'，
+    # 不是 Rockchip 老文档里写的 'Master Playback Volume'（那个在本板不存在）。
+    for ctl in Master Speaker Headphone PCM; do
+        amixer -q sset "$ctl" 80% unmute 2>/dev/null || true
+    done
+
+    if audio_running; then
+        echo "OK:蓝牙音频已开启"
+        return 0
+    fi
+    echo "FAIL:bluealsa 启动失败"
+    return 1
+}
+
+# 注意：不需要往 asound.conf 里 include bluealsa 的定义 ——
+# 系统 alsa.conf 会自动扫描 /etc/alsa/conf.d，pcm.bluealsa 本来就可直接引用。
+# （曾经加过 <confdir:/etc/alsa/conf.d>，因为 confdir 是相对路径解析的，
+#   把整份 asound.conf 搞成加载失败，已移除。）
+
+do_audio_off() {
+    # ⚠️⚠️ 绝对**不要** killall bluealsa（2026-10-13 修，真因见 docs 记录）⚠️⚠️
+    #
+    # bluealsa 注册的 A2DP Sink 端点就是"车机是个音箱"这个身份本身。
+    # 一旦杀掉它，手机侧立刻看不到 Audio Sink，于是主动断开 ACL：
+    #     dmesg: rtk_btcoex: TX l2cap disconn req ... psm 0x19 / 0x1b   (AVDTP/A2DP)
+    #     dmesg: rtk_btcoex: HCI Disconnect, handle 0004, reason 0x13  (远端主动断)
+    # 现场表现就是用户说的"能连但会掉"——而且**每次应用重启都会踩**：
+    # Audio 构造函数 360ms 处若认为"手机没连着"就调 audio-release，
+    # 把还在连的链路直接拆掉（日志：00:26:03 蓝牙音频已停止 → 3 秒后 reason 0x13）。
+    #
+    # 本地播放并不需要它让路：/etc/asound.conf 的 default = softvol -> dmixer，
+    # dmix 本来就是**多客户端共享** hw:0,0，bluealsa-aplay 与本地播放器可以共存。
+    # 所以只停 aplay（播放侧），bluealsa（端点）常驻。
+    # 这与 btmanager.cpp 里"只开，永远不关"的结论一致。
+    killall bluealsa-aplay >/dev/null 2>&1
+    rm -f "$APLAY_PID"
+    log "本地音源：已停 bluealsa-aplay，bluealsa(A2DP Sink 端点)继续保留 $(pidof bluealsa)"
+    echo "OK:关闭(aplay)；bluealsa 端点保留"
+    return 0
+}
+
+do_audio_status() {
+    if audio_running; then
+        echo "ok"
+        return 0
+    fi
+    echo "off"
+    return 2
+}
+
+# ---------------------------------------------------------------- 媒体控制
+#
+# 手机放歌时的角色分配：
+#   手机 = A2DP source + AVRCP **Target**（它的播放器归它自己管）
+#   车机 = A2DP sink   + 想发「上一首/下一首/真暂停」就必须是 AVRCP **Controller**
+# 本板的栈是 BlueZ 5 + BlueALSA 4.1.1：BlueZ 5 早就删掉了 AVRCP CT 的 D-Bus 接口
+# （只有 PulseAudio 自己实现了 CT），BlueALSA 只有 TG 角色。
+# 所以下面只做**车机侧**确实能做的三件事，next/prev 明确回报不支持，
+# 不让界面假装能用：
+#
+#   pause  —— kill -STOP bluealsa-aplay：本地播放停在当前位置（手机那头进度还在走）
+#   resume —— kill -CONT 继续
+#   volume —— ES8388 混音器（Master/Speaker/Headphone/PCM）
+#
+# 如果哪天换成 PulseAudio 或自己实现 AVRCP CT，把 next/prev 换掉即可。
+BT_PAUSE_FLAG=/var/run/smartcar-btmedia.paused
+
+# aplay 是**常驻**进程（audio-on 起一次就一直等任意设备），所以不能拿 pidof 判断
+# "现在有没有在放歌"。真正靠谱的是看声卡 PCM 是不是在 RUNNING
+# （/proc/asound/.../status 里 state: RUNNING，且 hw_ptr 在走）。
+bt_audio_active() {
+    # 显式列路径，别用 glob：busybox sh 下 glob 不匹配时会留下字面量，
+    # 反而把 [ -e ] 骗过去。两个声卡都查（ES8388 / 可能还有 loopback）。
+    for f in /proc/asound/card0/pcm0p/sub0/status \
+             /proc/asound/card1/pcm0p/sub0/status \
+             /proc/asound/card2/pcm0p/sub0/status; do
+        [ -e "$f" ] || continue
+        grep -q '^state: RUNNING' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+do_media_pause() {
+    pid=$(pidof bluealsa-aplay 2>/dev/null | awk '{print $1}')
+    if [ -z "$pid" ]; then
+        echo "FAIL:蓝牙音频通道未开启"
+        return 1
+    fi
+    if ! bt_audio_active && [ ! -e "$BT_PAUSE_FLAG" ]; then
+        echo "FAIL:没有正在播放的蓝牙音频"
+        return 1
+    fi
+    if kill -STOP "$pid" 2>/dev/null; then
+        : > "$BT_PAUSE_FLAG"
+        log "蓝牙音频已暂停（本地，pid=$pid）"
+        echo "OK:已暂停"
+        return 0
+    fi
+    amixer -q sset Master 0% 2>/dev/null
+    : > "$BT_PAUSE_FLAG"
+    echo "OK:已暂停(静音兜底)"
+    return 0
+}
+
+do_media_resume() {
+    pid=$(pidof bluealsa-aplay 2>/dev/null | awk '{print $1}')
+    if [ -n "$pid" ]; then
+        kill -CONT "$pid" 2>/dev/null
+    fi
+    for ctl in Master Speaker Headphone PCM; do
+        amixer -q sset "$ctl" 80% unmute 2>/dev/null || true
+    done
+    rm -f "$BT_PAUSE_FLAG"
+    log "蓝牙音频已恢复"
+    echo "OK:已恢复"
+    return 0
+}
+
+do_media_toggle() {
+    if [ -e "$BT_PAUSE_FLAG" ]; then
+        do_media_resume
+    else
+        do_media_pause
+    fi
+}
+
+do_media_volume() {
+    # 调用形如： bt-ctl media volume 45   ->  $1 = "45"
+    v=${1:-}
+    case "$v" in
+        ''|*[!0-9]*) echo "FAIL:音量参数需要 0-100"; return 1 ;;
+    esac
+    [ "$v" -gt 100 ] && v=100
+    for ctl in Master Speaker Headphone PCM; do
+        amixer -q sset "$ctl" "${v}%" 2>/dev/null || true
+    done
+    # 暂停标志存在时，调音量不改暂停状态（保持暂停，避免"调音量把音乐放出来"）
+    log "蓝牙音频音量设为 ${v}%"
+    echo "OK:volume=$v"
+    return 0
+}
+
+do_media_status() {
+    if ! pidof bluealsa-aplay >/dev/null 2>&1; then
+        echo "state=off"
+        return 0
+    fi
+    if [ -e "$BT_PAUSE_FLAG" ]; then
+        echo "state=paused"
+    elif bt_audio_active; then
+        echo "state=playing"
+    else
+        # 通道开着但没数据在流：手机没在放歌
+        echo "state=idle"
+    fi
+    vol=$(amixer sget Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)
+    echo "volume=${vol:-?}"
+    CONN=$(bluetoothctl devices Connected 2>/dev/null | head -1 | awk '{print $2}')
+    echo "phone=${CONN:-none}"
+    echo "avrcp_ct=unsupported"
+    return 0
+}
+
+do_media_next() {
+    echo "FAIL:本栈不支持上一首/下一首（需要 AVRCP Controller，BlueZ5+BlueALSA 不提供）"
+    return 3
+}
+
+
+do_status() {
+    # 给应用看的精简状态：powered / connected / audio
+    if bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then
+        echo "powered=yes"
+    else
+        echo "powered=no"
+    fi
+    CONN=$(bluetoothctl devices Connected 2>/dev/null | head -1 | awk '{print $2}')
+    echo "connected=${CONN:-none}"
+    if audio_running; then echo "audio=on"; else echo "audio=off"; fi
+    return 0
+}
+
+# ---------------------------------------------------------------- PulseAudio 后端
+#
+# 手机放歌时手机是 AVRCP Target；车机要发「真暂停/上一首/下一首」必须是 AVRCP
+# Controller。BlueZ5 + BlueALSA 只有 TG，给不了；PulseAudio 的 module-bluez5-device
+# 实现了 CT，并把远端播放器通过 **MPRIS**（org.mpris.MediaPlayer2.*）暴露出来，
+# 于是 play/pause/next/prev + 歌名歌手都能拿到。
+#
+# 切换方式（车机程序一行都不用改）：/etc/smartcar.conf 里加
+#     export SMARTCAR_BT_STACK=pulse
+# 之后 app 照样调 `bt-ctl audio-on/off/status`，内部自动走 PA；不设则仍是 BlueALSA。
+PA_LOG=/var/log/pulse.log
+PA_ENV="PULSE_SERVER=unix:/var/run/pulse/native"
+
+pa() { env $PA_ENV pactl "$@" 2>/dev/null; }
+pa_up() { pidof pulseaudio >/dev/null 2>&1; }
+
+do_pa_start() {
+    pa_up && return 0
+    mkdir -p /var/run/pulse /var/lib/pulse
+    chown -R pulse:pulse /var/run/pulse /var/lib/pulse 2>/dev/null
+    # ⚠️ 不用 `--daemonize`：这块板子上 `--daemonize + --log-target=file:` 会
+    # "起完立刻退出"（pidof 先能看到、几秒后就没了），而 setsid 后台运行没问题
+    # —— 实测对比过。所以这里用 setsid 后台跑，并保证日志文件可写。
+    : > "$PA_LOG" 2>/dev/null
+    chmod 666 "$PA_LOG" 2>/dev/null
+    setsid pulseaudio --system --disallow-exit --exit-idle-time=-1 \
+        --log-target=file:$PA_LOG </dev/null >/dev/null 2>&1 &
+    i=0
+    while [ $i -lt 20 ]; do pa_up && break; sleep 0.5; i=$((i + 1)); done
+    sleep 1                      # 再等一秒，确认不是"起完就退"
+    pa_up
+}
+
+pa_bluez_source() { pa list sources short | awk '$2 ~ /bluez_source/ {print $2; exit}'; }
+
+# 手机流 -> 本地声卡（幂等）
+do_pa_route() {
+    src=$(pa_bluez_source)
+    [ -n "$src" ] || return 1
+    sink=$(pa get-default-sink)
+    [ -n "$sink" ] || sink=$(pa list sinks short | awk 'NR==1{print $2}')
+    if ! pa list modules short | grep -q module-loopback; then
+        pa load-module module-loopback source="$src" sink="$sink" latency_msec=60 >/dev/null
+        log "已建立蓝牙音频环路: $src -> $sink"
+    fi
+    return 0
+}
+
+do_pa_on() {
+    killall bluealsa-aplay >/dev/null 2>&1
+    killall bluealsa >/dev/null 2>&1
+    rm -f "$APLAY_PID"
+    if ! do_pa_start; then
+        echo "FAIL:PulseAudio 启动失败（看 $PA_LOG）"
+        return 1
+    fi
+    i=0
+    while [ $i -lt 20 ]; do do_pa_route && break; sleep 0.5; i=$((i + 1)); done
+    if [ -n "$(pa_bluez_source)" ]; then
+        echo "OK:蓝牙音频已开启（PulseAudio/AVRCP CT）"
+    else
+        echo "OK:已开启，等待手机连接推流"
+    fi
+    return 0
+}
+
+do_pa_off() {
+    for m in $(pa list modules short | awk '$2 == "module-loopback" {print $1}'); do
+        pa unload-module "$m" >/dev/null 2>&1
+    done
+    # ⚠️ 关键 1：/etc/pulse/daemon.conf 里如果写着 `allow-exit = no`，PA 会
+    # **忽略所有退出请求**（连 SIGTERM 都忽略），`pactl exit` 是没用的
+    # （已把 daemon.conf 改成 allow-exit = yes）。
+    # ⚠️ 关键 2：这块板子的 busybox **没有 killall**（命令直接不存在，
+    # 以前 `killall pulseaudio` 失败还打了 2>/dev/null，看起来"已停止"，
+    # 实际 PA 一直活着占着 hw:0,0 —— 这就是"切回本地没声音/切几次两边都没声音"
+    # 的幕后推手）。所以一律用 pidof + kill。
+    pa exit >/dev/null 2>&1
+    i=0
+    while [ $i -lt 8 ] && pa_up; do sleep 0.3; i=$((i + 1)); done
+    if pa_up; then kill $(pidof pulseaudio) 2>/dev/null; fi
+    i=0
+    while [ $i -lt 8 ] && pa_up; do sleep 0.3; i=$((i + 1)); done
+    if pa_up; then
+        kill -9 $(pidof pulseaudio) 2>/dev/null
+        sleep 0.5
+    fi
+    log "PulseAudio 已停止"
+    if pa_up; then
+        echo "FAIL:PulseAudio 没停下来（pid=$(pidof pulseaudio)，还在占声卡）"
+        return 1
+    fi
+    echo "OK:关闭"
+    return 0
+}
+
+do_pa_status() {
+    pa_up || { echo "off"; return 2; }
+    src=$(pa_bluez_source)
+    if [ -n "$src" ]; then
+        echo "on source=$src sink=$(pa get-default-sink)"
+    else
+        echo "on waiting-phone"
+    fi
+    return 0
+}
+
+# ---------------------------------------------- 声卡"让出/收回"（本地播放必需）
+#
+# 板上 /etc/asound.conf 里 `pcm.!default` 是 softvol -> dmixer -> hw:0,0，
+# 也就是**应用走 ALSA 默认设备时用的是 dmix**；而 PulseAudio 的
+# module-alsa-card 是**直接独占 hw:0,0** 的（不经 dmix）。
+# 两边互抢，谁先抢到谁有声，另一方静默 —— 切几次音源就会"哪个音源都没声音"。
+#
+# 试过"挂起 sink"这种温和做法，但 pactl suspend-sink 是**用户级挂起（黏性）**：
+# PA 不会自己恢复，一旦漏掉一次 resume，蓝牙就永久哑。所以这里改成最直白的
+# 互斥：本地音源时**把 PA 整个停掉**（声卡完全空闲），蓝牙音源时再启动 PA。
+# 两个音频服务永不共存，就没有"谁占着卡"的问题了。
+do_audio_release() {          # 切回本地：停掉音频服务，声卡完全让给本地播放器
+    # ⚠️ 必须按 SMARTCAR_BT_STACK 分派：直接调 do_audio_off 是 BlueALSA 那一套，
+    #    pulse 模式下会变成"BLUEALSA 启动失败"而 PA 一动不动（踩过一次）。
+    if [ "${SMARTCAR_BT_STACK:-bluealsa}" = "pulse" ]; then
+        do_pa_off
+    else
+        do_audio_off
+    fi
+}
+
+do_audio_acquire() {          # 切到蓝牙：启动音频服务并建立蓝牙环路
+    if [ "${SMARTCAR_BT_STACK:-bluealsa}" = "pulse" ]; then
+        do_pa_on
+    else
+        do_audio_on
+    fi
+}
+
+mpris_name() {
+    dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.ListNames 2>/dev/null \
+        | grep -o 'org\.mpris\.MediaPlayer2\.[A-Za-z0-9_.-]*' | head -1
+}
+
+mpris_call() {   # $1 = Play|Pause|PlayPause|Next|Previous|Stop
+    p=$(mpris_name)
+    [ -n "$p" ] || { echo "FAIL:没有可控制的蓝牙播放器（手机没在放歌？）"; return 1; }
+    if dbus-send --system --print-reply --dest="$p" /org/mpris/MediaPlayer2 \
+            "org.mpris.MediaPlayer2.Player.$1" >/dev/null 2>&1; then
+        echo "OK:$1"
+        return 0
+    fi
+    echo "FAIL:$1 不被手机支持"
+    return 1
+}
+
+mpris_meta() {
+    p=$(mpris_name)
+    [ -n "$p" ] || { echo "FAIL:没有蓝牙播放器"; return 1; }
+    echo "player=$p"
+    dbus-send --system --print-reply --dest="$p" /org/mpris/MediaPlayer2 \
+        org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2.Player \
+        string:Metadata 2>/dev/null | sed -n 's/.*string "\(.*\)"/\1/p' | head -10
+    echo -n "position_us="
+    dbus-send --system --print-reply --dest="$p" /org/mpris/MediaPlayer2 \
+        org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2.Player \
+        string:Position 2>/dev/null | tail -1 | tr -dc '0-9'
+    echo
+    return 0
+}
+
+do_pa_volume() {
+    v=${1:-}
+    case "$v" in ''|*[!0-9]*) echo "FAIL:音量参数需要 0-100"; return 1 ;; esac
+    [ "$v" -gt 100 ] && v=100
+    s=$(pa get-default-sink)
+    [ -n "$s" ] && pa set-sink-volume "$s" "${v}%" >/dev/null
+    for ctl in Master Speaker Headphone PCM; do
+        amixer -q sset "$ctl" "${v}%" 2>/dev/null || true
+    done
+    echo "OK:volume=$v"
+    return 0
+}
+
+# ---------------------------------------------- 蓝牙音量（AVRCP 绝对音量）
+#
+# 实测（本板 BlueZ 5.77 + PulseAudio 16.1）：
+#   ✓ 写 A2DP 传输对象 org.bluez.MediaTransport1.Volume（uint16 0..127）
+#       → 立刻生效，就是手机侧的音量（AVRCP SetAbsoluteVolume）
+#   ✓ pactl set-source-volume bluez_source.<手机>.a2dp_source X%
+#       → 与传输 Volume 是**同一个值**（25% ⇄ 32，60% ⇄ 76，100% ⇄ 127），
+#         所以走 PA 一条命令就够了，不用去猜 fd0/fd7 这种传输对象名
+#   ✗ org.bluez.MediaControl1.VolumeUp/VolumeDown：返回 OK，但传输 Volume
+#     一点都不变（手机不理这对命令）——所以别再用它调音量
+bt_source_name() {
+    pa list short sources 2>/dev/null | awk '/bluez_source/ {print $2; exit}'
+}
+
+bt_abs_volume_set() {   # $1 = 0..100  → 手机音量
+    v=${1:-}
+    case "$v" in ''|*[!0-9]*) echo "FAIL:音量参数需要 0-100"; return 1 ;; esac
+    [ "$v" -gt 100 ] && v=100
+    s=$(bt_source_name)
+    if [ -n "$s" ] && pa set-source-volume "$s" "${v}%" >/dev/null 2>&1; then
+        echo "OK:bt-volume=$v"
+        return 0
+    fi
+    # 兜底：直接写传输对象的 Volume（0..127）
+    P=$(bt_transport_path) || { echo "FAIL:没有活动的蓝牙音频传输"; return 1; }
+    abs=$(( (v * 127 + 50) / 100 ))
+    if dbus-send --system --print-reply --dest=$BT_BUS "$P" \
+         org.freedesktop.DBus.Properties.Set string:org.bluez.MediaTransport1 \
+         string:Volume variant:uint16:$abs >/dev/null 2>&1; then
+        echo "OK:bt-volume=$v(abs=$abs)"
+        return 0
+    fi
+    echo "FAIL:设置手机音量失败"
+    return 1
+}
+
+bt_abs_volume_get() {   # 打印手机当前音量（0..100），给界面初始化滑块用
+    s=$(bt_source_name)
+    if [ -n "$s" ]; then
+        p=$(pa get-source-volume "$s" 2>/dev/null | grep -o '[0-9][0-9]*%' | head -1 | tr -d '%')
+        if [ -n "$p" ]; then echo "volume=$p"; return 0; fi
+    fi
+    P=$(bt_transport_path) || { echo "volume="; return 1; }
+    a=$(dbus-send --system --print-reply --dest=$BT_BUS "$P" \
+         org.freedesktop.DBus.Properties.Get string:org.bluez.MediaTransport1 \
+         string:Volume 2>/dev/null | sed -n 's/.*uint16[ \t]*\([0-9][0-9]*\).*/\1/p')
+    [ -n "$a" ] && echo "volume=$(( (a * 100 + 63) / 127 ))" || echo "volume="
+    return 0
+}
+
+# 进蓝牙音源前的一次性准备：
+#   1) 车机喇叭(PA sink)抬到"底线音量" —— 否则手机音量调到 100% 也会被
+#      一个很低的喇叭音量卡住（实测板子上 sink 只有 33%，-29dB，怎么调都闷）；
+#   2) 读回手机当前音量，让界面滑块显示的就是真实值。
+# 只抬不降：用户自己调过更大的喇叭音量不会被改小。
+BT_SINK_FLOOR=60
+bt_prepare() {
+    s=$(pa get-default-sink)
+    if [ -n "$s" ]; then
+        cur=$(pa get-sink-volume "$s" 2>/dev/null | grep -o '[0-9][0-9]*%' | head -1 | tr -d '%')
+        if [ -n "$cur" ] && [ "$cur" -lt "$BT_SINK_FLOOR" ]; then
+            pa set-sink-volume "$s" "${BT_SINK_FLOOR}%" >/dev/null 2>&1 && \
+                echo "sink=raised_to_${BT_SINK_FLOOR}(was_${cur})"
+        else
+            echo "sink=keep_${cur:-?}"
+        fi
+    fi
+    bt_abs_volume_get
+    return 0
+}
+
+# 找当前活动的 A2DP 传输对象（fd0/fd1/…/fd7 名字不固定，不能写死）
+bt_transport_path() {
+    D=$(bt_dev_path) || return 1
+    dbus-send --system --print-reply --dest=$BT_BUS "$D" \
+        org.freedesktop.DBus.Introspectable.Introspect 2>/dev/null \
+    | grep -o 'node name="fd[0-9]*"' | sed 's/node name="//; s/"//' \
+    | while read -r n; do
+        P="$D/$n"
+        if dbus-send --system --print-reply --dest=$BT_BUS "$P" \
+             org.freedesktop.DBus.Properties.Get string:org.bluez.MediaTransport1 \
+             string:State 2>/dev/null | grep -q 'string "active"'; then
+            echo "$P"
+            break
+        fi
+      done
+}
+
+# ------------------------------------------------- 蓝牙媒体（AVRCP CT，正解）
+#
+# 更正：之前以为要用 MPRIS/PulseAudio，实测都不行。真正的接口是 BlueZ 自己的：
+#   设备对象 /org/bluez/hci0/dev_XX
+#     org.bluez.MediaControl1  Play/Pause/Stop/Next/Previous/VolumeUp/VolumeDown
+#                             属性 Connected / Player
+#   远端播放器（Player 属性指向，通常是 .../player0）
+#     org.bluez.MediaPlayer1   Status / Position / Track{Title,Artist,Album,Duration}
+# 这两个接口在 BlueZ 5.77 里都在（标着 Deprecated 但完全可用），
+# 车机侧因此能真正控制手机播放并拿到歌名/歌手/时长/进度。
+BT_BUS=org.bluez
+
+bt_dev_path() {
+    D=$(bluetoothctl devices Connected 2>/dev/null | awk '{print $2}' | head -1)
+    [ -n "$D" ] || return 1
+    echo "/org/bluez/hci0/dev_$(echo "$D" | tr ':' '_')"
+}
+
+bt_player_path() {
+    P=$(bt_dev_path) || return 1
+    PL=$(dbus-send --system --print-reply --dest=$BT_BUS "$P" \
+            org.freedesktop.DBus.Properties.Get string:org.bluez.MediaControl1 \
+            string:Player 2>/dev/null | grep -o '"/org/bluez[^"]*"' | tr -d '"' | head -1)
+    if [ -n "$PL" ]; then echo "$PL"; else echo "$P/player0"; fi
+}
+
+bt_ctrl() {   # $1 = Play|Pause|Stop|Next|Previous|VolumeUp|VolumeDown
+    P=$(bt_dev_path) || { echo "FAIL:没有已连接的手机"; return 1; }
+    if dbus-send --system --print-reply --dest=$BT_BUS "$P" \
+            "org.bluez.MediaControl1.$1" >/dev/null 2>&1; then
+        echo "OK:$1"
+        return 0
+    fi
+    echo "FAIL:$1"
+    return 1
+}
+
+bt_prop() {   # $1 = Status|Position|Track
+    PL=$(bt_player_path) || return 1
+    dbus-send --system --print-reply --dest=$BT_BUS "$PL" \
+        org.freedesktop.DBus.Properties.Get string:org.bluez.MediaPlayer1 "string:$1" 2>/dev/null
+}
+
+bt_meta_field() {   # $1 = Title/Artist/Album（字符串型字段）
+    bt_prop Track | awk -v k="$1" '
+        index($0, "string \"" k "\"") {
+            getline                              # 下一行就是 variant ... string "值"
+            if (match($0, /string "[^"]*"/))
+                print substr($0, RSTART + 8, RLENGTH - 9)
+            exit
+        }'
+}
+
+bt_num_field() {    # $1 = Duration / TrackNumber（数值型字段）
+    bt_prop Track | awk -v k="$1" '
+        index($0, "string \"" k "\"") {
+            getline                              # 下一行：variant  uint32 259973
+            # ⚠️ 绝对不能取"这一行里的第一个数字"：dbus-send 会打印类型名
+            #    `uint32`，第一个数字是 **32** —— 曾经把 Duration=259973 解析成 32，
+            #    进度条/总时长因此全废。必须锚定在 uint32 之后再取数字。
+            if (match($0, /uint32[ \t]+[0-9][0-9]*/)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/uint32[ \t]+/, "", s)
+                print s
+            }
+            exit
+        }'
+}
+
+bt_player_call() {   # $1 = Press|Hold|Release（Press/Hold 需要 $2 = avc_key）
+    PL=$(bt_player_path) || return 1
+    if [ -n "${2:-}" ]; then
+        dbus-send --system --print-reply --dest=$BT_BUS "$PL" \
+            "org.bluez.MediaPlayer1.$1" "byte:$2" >/dev/null 2>&1
+    else
+        dbus-send --system --print-reply --dest=$BT_BUS "$PL" \
+            "org.bluez.MediaPlayer1.$1" >/dev/null 2>&1
+    fi
+}
+
+do_bt_media() {   # 给 app / 命令行用的一行行 kv
+    P=$(bt_dev_path) || { echo "state=disconnected"; return 0; }
+    st=$(bt_prop Status | tail -1 | grep -o '"[a-z]*"' | tr -d '"')
+    # ⚠️ 同一个坑：`grep -o '[0-9]*' | head -1` 会先命中类型名里的 "32"。
+    # 这里用 sed 锚定 uint32/uint16 之后的那一串数字（手机实测给的是毫秒）。
+    pos=$(bt_prop Position | tr '\n' ' ' \
+          | sed -n 's/.*uint\(32\|16\)[ \t]*\([0-9][0-9]*\).*/\2/p')
+    title=$(bt_meta_field Title)
+    artist=$(bt_meta_field Artist)
+    album=$(bt_meta_field Album)
+    dur=$(bt_num_field Duration)
+    # 注意：这里**曾经**多读一个 MediaPlayer1.Name（手机侧 App 名）给界面做徽标，
+    # 真机上确实拿到过（如 "抖音"）；用户明确要求不显示手机侧 App 名，已移除 ——
+    # 顺带省掉每 400ms 轮询里一次多余的 D-Bus 往返。界面徽标改用"形态名"
+    # （在线音乐 / 视频 / 无曲目信息）。
+    echo "state=${st:-unknown}"
+    echo "title=$title"
+    echo "artist=$artist"
+    echo "album=$album"
+    echo "duration=${dur:-0}"
+    echo "position=${pos:-0}"
+    return 0
+}
+
+case "${1:-}" in
+    audio-on)
+        if [ "${SMARTCAR_BT_STACK:-bluealsa}" = "pulse" ]; then do_pa_on; else do_audio_on; fi ;;
+    audio-off)
+        if [ "${SMARTCAR_BT_STACK:-bluealsa}" = "pulse" ]; then do_pa_off; else do_audio_off; fi ;;
+    audio-status)
+        if [ "${SMARTCAR_BT_STACK:-bluealsa}" = "pulse" ]; then do_pa_status; else do_audio_status; fi ;;
+    pa-on)        do_pa_on ;;
+    pa-off)       do_pa_off ;;
+    pa-status)    do_pa_status ;;
+    pa-route)     do_pa_route ;;
+    pa-play)      do_pa_start >/dev/null; mpris_call Play ;;
+    pa-pause)     mpris_call Pause ;;
+    pa-toggle)    mpris_call PlayPause ;;
+    pa-next)      mpris_call Next ;;
+    pa-prev)      mpris_call Previous ;;
+    pa-stop)      mpris_call Stop ;;
+    pa-meta)      mpris_meta ;;
+    pa-volume)    do_pa_volume "${2:-}" ;;
+    pa-mpris)     mpris_name ;;
+    bt-media)
+        case "${2:-}" in
+            status)          do_bt_media ;;
+            play)            bt_ctrl Play ;;
+            pause)           bt_ctrl Pause ;;
+            stop)            bt_ctrl Stop ;;
+            next)            bt_ctrl Next ;;
+            prev)            bt_ctrl Previous ;;
+            vol-up)          bt_ctrl VolumeUp ;;
+            vol-down)        bt_ctrl VolumeDown ;;
+            ff)              bt_ctrl FastForward; sleep 0.25; bt_player_call Release ;;
+            rew)             bt_ctrl Rewind;      sleep 0.25; bt_player_call Release ;;
+            player)          bt_player_path ;;
+            *) echo "Usage: $0 bt-media {status|play|pause|stop|next|prev|vol-up|vol-down|player}"; exit 1 ;;
+        esac
+        ;;
+    bt-volume)     bt_abs_volume_set "${2:-}" ;;      # 手机音量（AVRCP 绝对音量）
+    bt-volume-get) bt_abs_volume_get ;;
+    bt-prepare)    bt_prepare ;;                      # 进蓝牙音源前的准备（喇叭底线+读手机音量）
+    audio-release) do_audio_release ;;                # 让出声卡给本地播放器
+    audio-acquire) do_audio_acquire ;;                # 收回声卡给蓝牙音频
+    bt-sink-volume) do_pa_volume "${2:-}" ;;          # 车机喇叭（PA sink）音量
+    audio-on)     do_audio_on ;;
+    audio-off)    do_audio_off ;;
+    audio-status) do_audio_status ;;
+    status)       do_status ;;
+    media)
+        case "${2:-}" in
+            pause)  do_media_pause ;;
+            resume) do_media_resume ;;
+            toggle) do_media_toggle ;;
+            status) do_media_status ;;
+            volume) do_media_volume "${3:-}" ;;
+            next|prev) do_media_next ;;
+            *) echo "Usage: $0 media {pause|resume|toggle|status|volume <0-100>|next|prev}"; exit 1 ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $0 {audio-on|audio-off|audio-status|status|media <cmd>|bt-media <cmd>|bt-volume <0-100>|bt-volume-get|bt-sink-volume <0-100>}"
+        exit 1
+        ;;
+esac
